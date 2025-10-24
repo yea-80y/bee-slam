@@ -1,5 +1,7 @@
 # Environment files with secrets
 .env
+.env.local
+.env.*.local
 
 # Docker volumes
 bee-data/
@@ -9,3 +11,37 @@ proxy-data/
 proxy/node_modules/
 proxy/dist/
 proxy/pnpm-lock.yaml
+
+# Build artifacts
+*.log
+*.tgz
+dist/
+build/
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.classpath
+
+# Testing
+coverage/
+.nyc_output/
+
+# Temporary files
+tmp/
+temp/
+*.tmp

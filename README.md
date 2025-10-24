@@ -1,6 +1,11 @@
-# Bee Gateway - Ultra-Light Node with Whitelisting Proxy
+# Bee SLAM - Secure List Access Manager
 
-This repository contains a Docker-based setup for running an ultra-light Bee node with a TypeScript proxy that provides hash-based access control to Swarm content.
+[![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![GitHub Stars](https://img.shields.io/github/stars/mfw78/bee-slam?style=social)](https://github.com/mfw78/bee-slam/stargazers)
+[![Docker](https://img.shields.io/badge/docker-compose-blue)](https://docs.docker.com/compose/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-blue)](https://www.typescriptlang.org/)
+
+A Docker-based setup for running an ultra-light Bee node with a TypeScript proxy that provides hash-based access control to Ethereum Swarm content.
 
 ## What is Bee?
 
@@ -274,11 +279,16 @@ bee-gateway/
 
 ## Resources
 
+- **Bee SLAM Repository**: https://github.com/mfw78/bee-slam
 - **Bee Repository**: https://github.com/ethersphere/bee
 - **Swarm Documentation**: https://docs.ethswarm.org/
 - **Official Website**: https://www.ethswarm.org/
 - **Ethers.js Documentation**: https://docs.ethers.org/
 
+## Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
 ## License
 
-Bee is licensed under BSD-3-Clause. This configuration repository follows the same license.
+This project is licensed under the BSD 3-Clause License - see the [LICENSE](LICENSE) file for details.

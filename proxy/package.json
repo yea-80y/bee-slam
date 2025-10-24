@@ -1,7 +1,7 @@
 {
-  "name": "bee-gateway-proxy",
+  "name": "bee-slam-proxy",
   "version": "1.0.0",
-  "description": "Whitelisting proxy for Bee node",
+  "description": "Whitelisting proxy for Bee node - Secure List Access Manager",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
@@ -10,9 +10,25 @@
     "dev": "tsx watch src/index.ts",
     "test:ens": "tsx src/test-ens.ts"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "swarm",
+    "ethereum-swarm",
+    "bee",
+    "proxy",
+    "whitelist",
+    "access-control",
+    "gateway"
+  ],
+  "author": "mfw78",
   "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mfw78/bee-slam.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mfw78/bee-slam/issues"
+  },
+  "homepage": "https://github.com/mfw78/bee-slam#readme",
   "packageManager": "pnpm@10.19.0",
   "dependencies": {
     "ethers": "^6.15.0",
