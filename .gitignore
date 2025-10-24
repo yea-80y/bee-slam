@@ -3,3 +3,9 @@
 
 # Docker volumes
 bee-data/
+proxy-data/
+
+# Proxy dependencies and build artifacts
+proxy/node_modules/
+proxy/dist/
+proxy/pnpm-lock.yaml

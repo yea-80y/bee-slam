@@ -1,48 +1,58 @@
-# Bee Gateway - Ultra-Light Node
+# Bee Gateway - Ultra-Light Node with Whitelisting Proxy
 
-This repository contains a Docker-based setup for running an ultra-light Bee node to access the Ethereum Swarm network.
+This repository contains a Docker-based setup for running an ultra-light Bee node with a TypeScript proxy that provides hash-based access control to Swarm content.
 
 ## What is Bee?
 
-Bee is a client implementation for the Ethereum Swarm network - a decentralized storage and distribution network. This gateway provides read-only access to Swarm content without requiring blockchain interaction or token staking.
+Bee is a client implementation for the Ethereum Swarm network - a decentralized storage and distribution network. This gateway provides read-only access to whitelisted Swarm content without requiring blockchain interaction or token staking.
 
 ## Architecture
 
+### System Overview
+
+The gateway consists of two main components working together:
+
+1. **Bee Ultra-Light Node**: Connects to Swarm network for content retrieval
+2. **TypeScript Proxy**: Whitelisting gateway with admin API for access control
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     Docker Network                           │
+│                                                              │
+│  ┌──────────────────┐              ┌────────────────────┐   │
+│  │  Bee Proxy       │              │  Bee Ultra-Light   │   │
+│  │  (TypeScript)    │              │  Node              │   │
+│  │                  │──Internal──► │                    │   │
+│  │  Port 3000       │   Network    │  API: 1633        │   │
+│  │  - /bzz/:hash    │              │  P2P: 1634        │───┼──► Swarm Network
+│  │  - /admin/*      │              │                    │   │
+│  │  - Whitelist DB  │              │  Read-only access  │   │
+│  └──────────────────┘              └────────────────────┘   │
+│         │                                                    │
+└─────────┼────────────────────────────────────────────────────┘
+          │
+          ▼
+    External Access
+    (Port 3000 only)
+```
+
+### Security Model
+
+- **Bee node** is on an internal Docker network - not directly accessible from the host
+- **Proxy** is the only externally accessible component (port 3000)
+- All `/bzz/:hash` requests are validated against a persistent whitelist
+- Admin API allows dynamic whitelist management while running
+- P2P port (1634) remains exposed for Swarm network connectivity
+
 ### Node Type: Ultra-Light
 
-This setup runs an **ultra-light node** with the following characteristics:
+The Bee node runs in **ultra-light mode**:
 
 - **Read-only access**: Download files from Swarm
-- **No blockchain required**: Operates without connecting to Gnosis Chain
+- **No blockchain interaction**: Operates without Gnosis Chain connectivity
 - **No payment system**: SWAP protocol disabled (no xBZZ or xDAI needed)
 - **No storage commitment**: Does not participate in data storage or retrieval incentives
 - **Free tier**: Suitable for simple content access without earning rewards
-
-### Components
-
-```
-┌─────────────────────────────────────┐
-│        Docker Container             │
-│  ┌───────────────────────────────┐  │
-│  │   Bee Ultra-Light Node        │  │
-│  │                               │  │
-│  │   - API Server (port 1633)   │  │──► External Access
-│  │   - P2P Network (port 1634)  │  │──► Swarm Network
-│  │   - Local Storage            │  │
-│  └───────────────────────────────┘  │
-└─────────────────────────────────────┘
-         │
-         ▼
-    Docker Volume
-    (bee-data)
-```
-
-### Ports
-
-- **1633**: HTTP API endpoint for uploading/downloading content
-- **1634**: P2P networking port for connecting to other Bee nodes
-
-Both ports are exposed to allow external access to the gateway.
 
 ### Configuration
 
@@ -62,29 +72,35 @@ The `--skip-postage-snapshot` flag is crucial for ultra-light nodes, preventing 
 ### Prerequisites
 
 - Docker with Docker Compose
-- Open ports 1633 and 1634 (or configure firewall accordingly)
+- Port 3000 (proxy) and 1634 (P2P) available
 
 ### Setup
 
 1. **Configure environment**:
    ```bash
    cp .env.example .env
-   # Edit .env and set a secure password
+   # Edit .env and set a secure password for the Bee node
    ```
 
-2. **Start the node**:
+2. **Start the services**:
    ```bash
    docker compose up -d
    ```
 
-3. **Check node health**:
+   This starts both the Bee node and the proxy gateway.
+
+3. **Check proxy health**:
    ```bash
-   curl http://localhost:1633/health
+   curl http://localhost:3000/health
    ```
 
 4. **View logs**:
    ```bash
-   docker logs -f bee-gateway
+   # Proxy logs
+   docker logs -f bee-proxy
+
+   # Bee node logs
+   docker logs -f bee-node
    ```
 
 ### Stopping the Node
@@ -100,37 +116,91 @@ docker compose down -v
 
 ### Troubleshooting
 
-**Bootnode connection warnings**: It's normal to see warnings like "connect to bootnode failed" in the logs. The ultra-light node will continue to operate and serve API requests despite these warnings.
+**Bootnode connection warnings**: It's normal to see warnings like "connect to bootnode failed" in the Bee node logs. The ultra-light node will continue to operate despite these warnings.
 
-**Container restarting**: If the container continuously restarts, check that:
+**Proxy restarting**: If the proxy container continuously restarts, check:
+- The Bee node is running (`docker ps` should show `bee-node`)
+- Port 3000 is not already in use
+
+**Bee node restarting**: If the bee-node container continuously restarts, check that:
 - The password is set in `.env` file
 - Docker has sufficient resources
-- Ports 1633 and 1634 are not already in use
+- Port 1634 is not already in use
+
+**403 Access Denied**: The requested Swarm hash is not in the whitelist. Add it via the admin API.
 
 ## API Usage
 
-### Health Check
+### Proxy Endpoints
+
+#### Health Check
 
 ```bash
-curl http://localhost:1633/health
+curl http://localhost:3000/health
 ```
 
-### Node Information
+#### Access Swarm Content (Whitelisted Only)
 
 ```bash
-curl http://localhost:1633/addresses
+# Access whitelisted content
+curl http://localhost:3000/bzz/<swarm-hash>
+
+# Access with subpath
+curl http://localhost:3000/bzz/<swarm-hash>/path/to/file.txt
 ```
 
-### Download Content
+### Admin API - Whitelist Management
+
+#### Get All Whitelisted Hashes
 
 ```bash
-# Download by Swarm hash
-curl http://localhost:1633/bzz/<swarm-hash> -o output.file
+curl http://localhost:3000/admin/whitelist
 ```
 
-### API Documentation
+#### Add Single Hash
 
-Full API documentation available at: https://docs.ethswarm.org/api/
+```bash
+curl -X POST http://localhost:3000/admin/whitelist \
+  -H "Content-Type: application/json" \
+  -d '{"hash":"<64-char-hex-hash>"}'
+```
+
+#### Add Multiple Hashes
+
+```bash
+curl -X POST http://localhost:3000/admin/whitelist \
+  -H "Content-Type: application/json" \
+  -d '{"hashes":["<hash1>","<hash2>","<hash3>"]}'
+```
+
+#### Remove Hash
+
+```bash
+curl -X DELETE http://localhost:3000/admin/whitelist/<hash>
+```
+
+#### Clear Entire Whitelist
+
+```bash
+curl -X DELETE http://localhost:3000/admin/whitelist
+```
+
+### ENS Integration Test
+
+The proxy includes a test script that resolves ENS names to Swarm hashes:
+
+```bash
+# From the proxy directory
+cd proxy
+pnpm test:ens              # Tests woco.eth by default
+pnpm test:ens mydomain.eth # Test any ENS name
+```
+
+This script:
+1. Resolves the ENS name on Ethereum mainnet
+2. Extracts the Swarm content hash
+3. Adds it to the whitelist
+4. Tests accessing the content through the proxy
 
 ## Node Types Comparison
 
@@ -155,13 +225,25 @@ As an ultra-light node:
 
 ## Security Considerations
 
-⚠️ **Current Configuration**: Both ports 1633 and 1634 are exposed on all network interfaces for external access.
+### Current Protection
 
-**Recommended for production**:
+✅ **Bee node isolated**: API port (1633) only accessible within Docker network
+✅ **Whitelist enforcement**: Only approved hashes can be accessed
+✅ **Persistent whitelist**: Survives container restarts
+✅ **Admin API**: Dynamic whitelist management
+
+### Recommended for Production
+
+⚠️ **Admin API Protection**: The admin endpoints (`/admin/*`) should be protected:
+- Add authentication middleware (API keys, JWT, etc.)
+- Restrict to specific IPs via firewall
+- Use a reverse proxy with authentication
+
+**Additional Hardening**:
 - Use a reverse proxy (nginx, traefik) with TLS termination
-- Implement authentication for API access
-- Configure firewall rules to restrict access
-- Consider using `BEE_CORS_ALLOWED_ORIGINS` with specific domains
+- Configure firewall rules to restrict proxy access
+- Monitor whitelist changes
+- Regular security audits of whitelisted content
 
 ## Upgrading
 
@@ -172,11 +254,30 @@ docker compose pull
 docker compose up -d
 ```
 
+## Project Structure
+
+```
+bee-gateway/
+├── docker-compose.yml          # Multi-container orchestration
+├── .env                        # Bee node password (gitignored)
+├── .env.example               # Environment template
+├── proxy/                     # TypeScript proxy service
+│   ├── src/
+│   │   ├── index.ts          # Main proxy server
+│   │   ├── whitelist.ts      # Whitelist manager with persistence
+│   │   └── test-ens.ts       # ENS resolution test script
+│   ├── Dockerfile            # Multi-stage build for proxy
+│   ├── package.json
+│   └── tsconfig.json
+└── README.md
+```
+
 ## Resources
 
 - **Bee Repository**: https://github.com/ethersphere/bee
 - **Swarm Documentation**: https://docs.ethswarm.org/
 - **Official Website**: https://www.ethswarm.org/
+- **Ethers.js Documentation**: https://docs.ethers.org/
 
 ## License
 

@@ -1,15 +1,17 @@
 services:
   bee:
     image: ethersphere/bee:stable
-    container_name: bee-gateway
+    container_name: bee-node
     restart: unless-stopped
-    network_mode: host
     environment:
-      # Password for node encryption
       - BEE_PASSWORD=${BEE_PASSWORD}
-    # Note: Using host network mode - ports are automatically available on host
     volumes:
       - bee-data:/home/bee/.bee
+    networks:
+      - bee-internal
+    ports:
+      # P2P port needs to be exposed for peer connectivity
+      - "1634:1634"
     command: >
       start
       --api-addr=:1633
@@ -21,5 +23,30 @@ services:
       --skip-postage-snapshot
       --mainnet=true
 
+  proxy:
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile
+    container_name: bee-proxy
+    restart: unless-stopped
+    environment:
+      - PORT=3000
+      - BEE_API_URL=http://bee-node:1633
+      - WHITELIST_PATH=/data/whitelist.json
+    volumes:
+      - proxy-data:/data
+    networks:
+      - bee-internal
+    ports:
+      # Only expose the proxy to the host
+      - "3000:3000"
+    depends_on:
+      - bee
+
+networks:
+  bee-internal:
+    driver: bridge
+
 volumes:
   bee-data:
+  proxy-data:
