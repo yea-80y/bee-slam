@@ -46,11 +46,16 @@ Both ports are exposed to allow external access to the gateway.
 
 ### Configuration
 
-Key settings in `docker-compose.yml`:
+Key command-line flags in `docker-compose.yml`:
 
-- `BEE_FULL_NODE=false`: Runs as a light node
-- `BEE_SWAP_ENABLE=false`: Disables payment/incentive system
-- `BEE_CORS_ALLOWED_ORIGINS=*`: Allows API access from any origin
+- `--full-node=false`: Runs as a light node (not full node)
+- `--swap-enable=false`: Disables SWAP payment protocol
+- `--skip-postage-snapshot`: Skips postage stamp contract synchronization
+- `--cors-allowed-origins=*`: Allows API access from any origin
+- `--api-addr=:1633`: HTTP API listen address
+- `--p2p-addr=:1634`: P2P networking listen address
+
+The `--skip-postage-snapshot` flag is crucial for ultra-light nodes, preventing unnecessary blockchain synchronization attempts.
 
 ## Getting Started
 
@@ -92,6 +97,15 @@ To remove all data (including downloaded content):
 ```bash
 docker compose down -v
 ```
+
+### Troubleshooting
+
+**Bootnode connection warnings**: It's normal to see warnings like "connect to bootnode failed" in the logs. The ultra-light node will continue to operate and serve API requests despite these warnings.
+
+**Container restarting**: If the container continuously restarts, check that:
+- The password is set in `.env` file
+- Docker has sufficient resources
+- Ports 1633 and 1634 are not already in use
 
 ## API Usage
 
@@ -137,6 +151,7 @@ As an ultra-light node:
 - **No persistence guarantees**: Does not contribute to long-term data storage
 - **Limited functionality**: Access to free-tier services only
 - **Network participation**: Minimal - primarily for content retrieval
+- **Bootnode connectivity**: May show warnings about bootnode connection failures, but the node will remain operational
 
 ## Security Considerations
 
