@@ -772,14 +772,19 @@ app.post('/feeds/:owner/:topic', uploadLimiter, async (req: Request, res: Respon
     // For feed updates, read as buffer and decompress if gzip-encoded
     let responseBuffer = Buffer.from(await response.arrayBuffer());
 
-    // Decompress if gzip-encoded (Bee often returns gzip responses)
-    if (response.headers.get('content-encoding') === 'gzip') {
+    // Decompress if gzip-encoded - check both header AND magic bytes (0x1f 0x8b)
+    const isGzipHeader = response.headers.get('content-encoding') === 'gzip';
+    const isGzipData = responseBuffer.length >= 2 && responseBuffer[0] === 0x1f && responseBuffer[1] === 0x8b;
+
+    if (isGzipHeader && isGzipData) {
       try {
         responseBuffer = gunzipSync(responseBuffer);
         console.log('Decompressed gzip feed response');
       } catch (e) {
         console.error('Failed to decompress gzip feed response:', e);
       }
+    } else if (isGzipHeader && !isGzipData) {
+      console.log('Header says gzip but data is not gzip-encoded, skipping decompression');
     }
 
     // Copy headers but skip content-encoding (we're sending decompressed data)
@@ -865,14 +870,19 @@ app.post('/soc/:owner/:id',
       // For successful responses, read the body as buffer and decompress if gzip-encoded
       let responseBuffer = Buffer.from(await response.arrayBuffer());
 
-      // Decompress if gzip-encoded (Bee often returns gzip responses)
-      if (response.headers.get('content-encoding') === 'gzip') {
+      // Decompress if gzip-encoded - check both header AND magic bytes (0x1f 0x8b)
+      const isGzipHeader = response.headers.get('content-encoding') === 'gzip';
+      const isGzipData = responseBuffer.length >= 2 && responseBuffer[0] === 0x1f && responseBuffer[1] === 0x8b;
+
+      if (isGzipHeader && isGzipData) {
         try {
           responseBuffer = gunzipSync(responseBuffer);
           console.log('Decompressed gzip SOC response');
         } catch (e) {
           console.error('Failed to decompress gzip SOC response:', e);
         }
+      } else if (isGzipHeader && !isGzipData) {
+        console.log('Header says gzip but data is not gzip-encoded, skipping decompression');
       }
       console.log(`Bee response body length: ${responseBuffer.length} bytes`);
 
