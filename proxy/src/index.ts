@@ -1,5 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import rateLimit from 'express-rate-limit';
+import { gunzipSync } from 'zlib';
 import { WhitelistManager } from './whitelist.js';
 
 const app = express();
@@ -768,12 +769,22 @@ app.post('/feeds/:owner/:topic', uploadLimiter, async (req: Request, res: Respon
       return;
     }
 
-    // For feed updates, read as buffer (handles gzip automatically) and send as-is
-    const responseBuffer = Buffer.from(await response.arrayBuffer());
+    // For feed updates, read as buffer and decompress if gzip-encoded
+    let responseBuffer = Buffer.from(await response.arrayBuffer());
 
-    // Copy headers but skip content-encoding (we're sending raw buffer)
+    // Decompress if gzip-encoded (Bee often returns gzip responses)
+    if (response.headers.get('content-encoding') === 'gzip') {
+      try {
+        responseBuffer = gunzipSync(responseBuffer);
+        console.log('Decompressed gzip feed response');
+      } catch (e) {
+        console.error('Failed to decompress gzip feed response:', e);
+      }
+    }
+
+    // Copy headers but skip content-encoding (we're sending decompressed data)
     response.headers.forEach((value, key) => {
-      if (key.toLowerCase() !== 'content-encoding') {
+      if (key.toLowerCase() !== 'content-encoding' && key.toLowerCase() !== 'content-length') {
         res.setHeader(key, value);
       }
     });
@@ -851,8 +862,18 @@ app.post('/soc/:owner/:id',
         return;
       }
 
-      // For successful responses, read the body as buffer to handle gzip correctly
-      const responseBuffer = Buffer.from(await response.arrayBuffer());
+      // For successful responses, read the body as buffer and decompress if gzip-encoded
+      let responseBuffer = Buffer.from(await response.arrayBuffer());
+
+      // Decompress if gzip-encoded (Bee often returns gzip responses)
+      if (response.headers.get('content-encoding') === 'gzip') {
+        try {
+          responseBuffer = gunzipSync(responseBuffer);
+          console.log('Decompressed gzip SOC response');
+        } catch (e) {
+          console.error('Failed to decompress gzip SOC response:', e);
+        }
+      }
       console.log(`Bee response body length: ${responseBuffer.length} bytes`);
 
       // Auto-whitelist any content references in the SOC body
@@ -878,10 +899,11 @@ app.post('/soc/:owner/:id',
         }
       }
 
-      // Copy headers from Bee response, but skip content-encoding since we're sending raw buffer
+      // Copy headers from Bee response, but skip content-encoding and content-length
+      // since we may have decompressed the data
       response.headers.forEach((value, key) => {
-        // Don't copy content-encoding as we're sending the uncompressed/original buffer
-        if (key.toLowerCase() !== 'content-encoding') {
+        // Don't copy content-encoding or content-length as we're sending decompressed data
+        if (key.toLowerCase() !== 'content-encoding' && key.toLowerCase() !== 'content-length') {
           res.setHeader(key, value);
         }
       });
