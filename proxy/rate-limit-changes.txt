@@ -1,0 +1,35 @@
+Replace lines 16-42 in src/index.ts with:
+
+// Rate limiting configuration
+// General rate limit - 1000 requests per 1 minute per IP (burst-friendly for browsing)
+const generalLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 1000, // Limit each IP to 1000 requests per window
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+});
+
+// Strict rate limit for uploads - 300 requests per hour per IP (increased for POD collectibles)
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 300, // Limit uploads to prevent abuse (allows up to 300-edition collectibles)
+  message: 'Too many upload requests, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Admin endpoint rate limit - 50 requests per 15 minutes per IP
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 50,
+  message: 'Too many admin requests, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+AND replace lines 697-699 with:
+
+        console.log('  - General: 1000 req/1min per IP');
+        console.log('  - Uploads: 300 req/1hour per IP');
+        console.log('  - Admin: 50 req/15min per IP');

@@ -77,7 +77,7 @@ async function addToWhitelist(hash: string): Promise<void> {
     throw new Error(`Failed to add to whitelist: ${response.statusText}`);
   }
 
-  const result = await response.json();
+  const result = await response.json() as { count: number };
   console.log(`✅ Added to whitelist. Total hashes: ${result.count}`);
 }
 

@@ -10,19 +10,30 @@ const whitelistPath = process.env.WHITELIST_PATH ?? '/data/whitelist.json';
 
 const whitelist = new WhitelistManager(whitelistPath);
 
+// Feed owners that are allowed to create new feeds without manual whitelisting.
+// Any feed manifest from these owners bypasses the whitelist check automatically.
+const ALLOWED_FEED_OWNERS = new Set([
+  'f8af4904c6e4f08ce5f7deab7f01221280b23a80' // WoCo main feed owner
+]);
+
 // Known feed manifests - when Bee can't resolve these due to missing trie nodes,
 // we fall back to querying the feed directly. This is seeded with known manifests
 // but dynamically populated as new feed manifests are discovered.
 const FEED_MANIFEST_REGISTRY: Record<string, { owner: string; topic: string }> = {
-  // Main website feed manifest
+  // Gateway feed manifest (topic: woco-website-v2)
   '9ebcea7ca2d4a3a975d1724ee579856684dc6f2ffa3082b64317006c922f3100': {
     owner: 'f8af4904c6e4f08ce5f7deab7f01221280b23a80',
-    topic: 'bb6a23bf07aa84a41fe44a485dd811ea10cc57a7cb88257789920813549f81d1'
+    topic: '57d52cda5c8794db2dc1540fde6be327e9d7ea120f8c491eef9f8469e7167568'
   },
-  // New manifest with correct topic
+  // Legacy feed manifest (topic: woco-website)
   '0b4ea8162a3fcbb19b63705f0c97137eef667d3c3cd4ecf69d686c5f98fb0054': {
     owner: 'f8af4904c6e4f08ce5f7deab7f01221280b23a80',
     topic: 'bb6a23bf07aa84a41fe44a485dd811ea10cc57a7cb88257789920813549f81d1'
+  },
+  // ENS feed manifest (topic: woco-ens-2026)
+  'e315d1798ec34cc7137c6b8c79cb28d586d972898fef769cdca08ad13b74d89c': {
+    owner: 'f8af4904c6e4f08ce5f7deab7f01221280b23a80',
+    topic: '20449894e8e4183fc8f0ba08b57e55ca9c0a3d669cab29e1eaf12a4ccc927e0e'
   }
 };
 
@@ -129,9 +140,38 @@ async function resolveFeed(owner: string, topic: string): Promise<string | null>
     console.log(`Resolving feed: ${feedUrl}`);
     const response = await fetchWithTimeout(feedUrl);
     if (response.ok) {
-      const ref = await response.text();
-      console.log(`Feed resolved to: ${ref.trim()}`);
-      return ref.trim();
+      // Feed endpoint returns binary data, not text
+      // Format: varies by payload, but reference is typically after initial bytes
+      const buffer = await response.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+
+      console.log(`Feed response: ${bytes.length} bytes`);
+
+      // Look for 32-byte reference in the response
+      // The feed chunk payload starts with padding/timestamp, then the reference
+      // Based on observed data, reference starts at offset 32 (after 32 bytes of padding)
+      if (bytes.length >= 64) {
+        const refBytes = bytes.slice(32, 64);
+        const refHex = Array.from(refBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+
+        // Verify it looks like a valid reference (not all zeros)
+        if (!/^0+$/.test(refHex)) {
+          console.log(`Feed resolved to reference: ${refHex}`);
+          return refHex;
+        }
+      }
+
+      // Fallback: try to find a 64-char hex string in the response
+      const text = new TextDecoder().decode(bytes);
+      const hexMatch = text.match(/[a-f0-9]{64}/i);
+      if (hexMatch) {
+        console.log(`Feed resolved to reference (text match): ${hexMatch[0]}`);
+        return hexMatch[0].toLowerCase();
+      }
+
+      console.log(`Could not extract reference from feed response`);
+      console.log(`First 100 bytes hex: ${Array.from(bytes.slice(0, 100)).map(b => b.toString(16).padStart(2, '0')).join('')}`);
+      return null;
     }
     console.log(`Feed resolution failed with status: ${response.status}`);
     return null;
@@ -412,6 +452,44 @@ app.patch('/stamps/topup/:batchId/:amount', adminLimiter, async (req: Request, r
 });
 
 /**
+ * Dilute a postage batch (increase depth to allow more storage)
+ * PATCH /stamps/dilute/:batchId/:depth
+ * Note: Dilution is irreversible and halves TTL for each depth increase
+ */
+app.patch('/stamps/dilute/:batchId/:depth', adminLimiter, async (req: Request, res: Response) => {
+  const { batchId, depth } = req.params;
+
+  try {
+    console.log(`Diluting batch ${batchId} to depth ${depth}`);
+
+    const response = await fetchWithTimeout(`${beeApiUrl}/stamps/dilute/${batchId}/${depth}`, {
+      method: 'PATCH'
+    }, 120000); // 120 seconds for blockchain operation
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Dilution failed:', errorText);
+      res.status(response.status).json({
+        error: 'Dilution failed',
+        message: errorText
+      });
+      return;
+    }
+
+    const data = await response.json();
+    console.log(`Batch ${batchId} diluted to depth ${depth} successfully`);
+    res.json(data);
+  } catch (error) {
+    console.error('Error diluting batch:', error);
+    const statusCode = (error as Error).message.includes('timeout') ? 504 : 502;
+    res.status(statusCode).json({
+      error: 'Failed to dilute batch',
+      message: (error as Error).message
+    });
+  }
+});
+
+/**
  * Upload endpoint for posting content to Swarm
  * Automatically whitelists the returned hash
  */
@@ -559,13 +637,47 @@ app.post('/bytes', uploadLimiter, async (req: Request, res: Response) => {
 });
 
 /**
+ * Check if a hash should be allowed access (whitelist OR known/detected feed manifest)
+ *
+ * Priority order (fast paths first):
+ * 1. Whitelist check (instant)
+ * 2. Known feed manifest in registry + allowed owner (instant)
+ * 3. Auto-detect feed manifest + allowed owner (one-time network request, then cached)
+ */
+async function isHashAllowed(hash: string): Promise<boolean> {
+  const normalizedHash = hash.toLowerCase();
+
+  // Fast path 1: Check whitelist
+  if (whitelist.isWhitelisted(normalizedHash)) {
+    return true;
+  }
+
+  // Fast path 2: Check if it's a known feed manifest from an allowed owner
+  const knownFeedInfo = FEED_MANIFEST_REGISTRY[normalizedHash];
+  if (knownFeedInfo && ALLOWED_FEED_OWNERS.has(knownFeedInfo.owner.toLowerCase())) {
+    console.log(`Feed manifest ${hash} allowed via registry + ALLOWED_FEED_OWNERS`);
+    return true;
+  }
+
+  // Slow path: Try to detect if this is a feed manifest from an allowed owner
+  // This only happens once per unknown hash - result is cached in registry or NOT_FEED_MANIFEST_CACHE
+  const detectedFeedInfo = await detectFeedManifest(normalizedHash);
+  if (detectedFeedInfo && ALLOWED_FEED_OWNERS.has(detectedFeedInfo.owner.toLowerCase())) {
+    console.log(`Feed manifest ${hash} auto-detected and allowed - owner ${detectedFeedInfo.owner} is in ALLOWED_FEED_OWNERS`);
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * GET /bytes/:hash endpoint for retrieving raw bytes
  * Only allows access to whitelisted hashes
  */
 app.get('/bytes/:hash', async (req: Request, res: Response) => {
   const hash = req.params.hash;
 
-  if (!whitelist.isWhitelisted(hash)) {
+  if (!(await isHashAllowed(hash))) {
     console.warn(`Blocked access to non-whitelisted hash: ${hash}`);
     res.status(403).json({
       error: 'Access denied',
@@ -769,17 +881,25 @@ app.post('/feeds/:owner/:topic', uploadLimiter, async (req: Request, res: Respon
       return;
     }
 
-    // For feed updates, read as buffer and decompress if gzip-encoded
+    // For feed updates, read as buffer
     let responseBuffer = Buffer.from(await response.arrayBuffer());
 
-    // Decompress if gzip-encoded - check both header AND magic bytes (0x1f 0x8b)
+    // Debug logging
+    console.log('Feed response - headers:', JSON.stringify([...response.headers.entries()]));
+    console.log('Feed response - buffer length:', responseBuffer.length);
+    console.log('Feed response - first 100 bytes:', responseBuffer.subarray(0, 100).toString('utf8'));
+    console.log('Feed response - first 10 hex:', responseBuffer.subarray(0, 10).toString('hex'));
+
+    // Check if gzip-encoded - check both header AND magic bytes (0x1f 0x8b)
     const isGzipHeader = response.headers.get('content-encoding') === 'gzip';
     const isGzipData = responseBuffer.length >= 2 && responseBuffer[0] === 0x1f && responseBuffer[1] === 0x8b;
+
+    console.log('Feed response - isGzipHeader:', isGzipHeader, ', isGzipData:', isGzipData);
 
     if (isGzipHeader && isGzipData) {
       try {
         responseBuffer = gunzipSync(responseBuffer);
-        console.log('Decompressed gzip feed response');
+        console.log('Decompressed gzip feed response, new length:', responseBuffer.length);
       } catch (e) {
         console.error('Failed to decompress gzip feed response:', e);
       }
@@ -787,15 +907,11 @@ app.post('/feeds/:owner/:topic', uploadLimiter, async (req: Request, res: Respon
       console.log('Header says gzip but data is not gzip-encoded, skipping decompression');
     }
 
-    // Copy headers but skip content-encoding (we're sending decompressed data)
-    response.headers.forEach((value, key) => {
-      if (key.toLowerCase() !== 'content-encoding' && key.toLowerCase() !== 'content-length') {
-        res.setHeader(key, value);
-      }
-    });
-
+    // Set content-type explicitly as JSON
+    res.setHeader('content-type', 'application/json; charset=utf-8');
     res.setHeader('content-length', responseBuffer.length.toString());
     res.status(response.status).send(responseBuffer);
+    console.log('Feed response sent to client, length:', responseBuffer.length);
   } catch (error) {
     console.error('Error updating feed:', error);
     const statusCode = (error as Error).message.includes('timeout') ? 504 : 500;
@@ -948,7 +1064,7 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
   console.log("DEBUG: hash =", hash);
   console.log("DEBUG: subpath =", subpath);
 
-  if (!whitelist.isWhitelisted(hash)) {
+  if (!(await isHashAllowed(hash))) {
     console.warn(`Blocked access to non-whitelisted hash: ${hash}`);
     res.status(403).json({
       error: 'Access denied',

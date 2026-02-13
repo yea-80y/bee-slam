@@ -15,9 +15,11 @@ export class WhitelistManager {
    */
   async initialize(): Promise<void> {
     try {
+      console.log(`Loading whitelist from ${this.persistPath}`);
       const data = await fs.readFile(this.persistPath, 'utf-8');
       const hashes: string[] = JSON.parse(data);
-      this.whitelist = new Set(hashes);
+      // Normalize all hashes to lowercase for consistent matching
+      this.whitelist = new Set(hashes.map(h => h.toLowerCase()));
       console.log(`Loaded ${this.whitelist.size} hashes from whitelist`);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -39,6 +41,7 @@ export class WhitelistManager {
       await fs.mkdir(dir, { recursive: true });
       const data = JSON.stringify(Array.from(this.whitelist), null, 2);
       await fs.writeFile(this.persistPath, data, 'utf-8');
+      console.log(`Persisted whitelist (${this.whitelist.size} hashes) to ${this.persistPath}`);
     } catch (error) {
       console.error('Error persisting whitelist:', error);
       throw error;
@@ -46,41 +49,41 @@ export class WhitelistManager {
   }
 
   /**
-   * Check if a hash is whitelisted
+   * Check if a hash is whitelisted (case-insensitive)
    */
   isWhitelisted(hash: string): boolean {
-    return this.whitelist.has(hash);
+    return this.whitelist.has(hash.toLowerCase());
   }
 
   /**
-   * Add a hash to the whitelist
+   * Add a hash to the whitelist (normalized to lowercase)
    */
   async add(hash: string): Promise<void> {
     if (!this.isValidHash(hash)) {
       throw new Error('Invalid hash format');
     }
-    this.whitelist.add(hash);
+    this.whitelist.add(hash.toLowerCase());
     await this.persist();
   }
 
   /**
-   * Add multiple hashes to the whitelist
+   * Add multiple hashes to the whitelist (normalized to lowercase)
    */
   async addMany(hashes: string[]): Promise<void> {
     for (const hash of hashes) {
       if (!this.isValidHash(hash)) {
         throw new Error(`Invalid hash format: ${hash}`);
       }
-      this.whitelist.add(hash);
+      this.whitelist.add(hash.toLowerCase());
     }
     await this.persist();
   }
 
   /**
-   * Remove a hash from the whitelist
+   * Remove a hash from the whitelist (case-insensitive)
    */
   async remove(hash: string): Promise<void> {
-    this.whitelist.delete(hash);
+    this.whitelist.delete(hash.toLowerCase());
     await this.persist();
   }
 

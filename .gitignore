@@ -45,3 +45,10 @@ coverage/
 tmp/
 temp/
 *.tmp
+
+# Local archives / backups
+*.tar.gz
+*.backup
+*_backup.*
+*_old*.*
+*_new*.*

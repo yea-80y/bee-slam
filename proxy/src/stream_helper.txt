@@ -1,0 +1,37 @@
+
+/**
+ * Helper function to stream response with timeout protection
+ * Wraps each reader.read() call with a timeout to prevent hanging
+ * @param reader - ReadableStream reader
+ * @param res - Express response object
+ * @param timeout - Timeout in milliseconds for each read operation
+ */
+async function streamWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  res: Response,
+  timeout: number = BEE_REQUEST_TIMEOUT
+): Promise<void> {
+  while (true) {
+    // Race between read() and timeout
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('Stream read timeout')), timeout);
+    });
+
+    try {
+      const result = await Promise.race([
+        reader.read(),
+        timeoutPromise
+      ]);
+
+      if (result.done) {
+        res.end();
+        return;
+      }
+
+      res.write(Buffer.from(result.value));
+    } catch (error) {
+      reader.cancel();
+      throw error;
+    }
+  }
+}
