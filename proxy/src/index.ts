@@ -20,6 +20,11 @@ const ALLOWED_FEED_OWNERS = new Set([
 // we fall back to querying the feed directly. This is seeded with known manifests
 // but dynamically populated as new feed manifests are discovered.
 const FEED_MANIFEST_REGISTRY: Record<string, { owner: string; topic: string }> = {
+  // WoCo Events App feed manifest (topic: woco-events-v1) — used by woco.eth.limo
+  'd66c6ff7650a468c2fd98439c8f04547b5b8a4b933d349ff16db1d0b00c23adc': {
+    owner: 'f8af4904c6e4f08ce5f7deab7f01221280b23a80',
+    topic: 'aef7b3bb8b50eff1516536370de7ab15de8e24592a35d2abd9977d00ebb650b2'
+  },
   // Gateway feed manifest (topic: woco-website-v2)
   '9ebcea7ca2d4a3a975d1724ee579856684dc6f2ffa3082b64317006c922f3100': {
     owner: 'f8af4904c6e4f08ce5f7deab7f01221280b23a80',
@@ -41,13 +46,13 @@ const FEED_MANIFEST_REGISTRY: Record<string, { owner: string; topic: string }> =
 const NOT_FEED_MANIFEST_CACHE = new Set<string>();
 
 // Cache for resolved feed content references (feed manifest hash -> content ref)
-// TTL: 60 seconds to pick up feed updates reasonably quickly
 const FEED_CONTENT_CACHE: Map<string, { contentRef: string; expires: number }> = new Map();
-const FEED_CACHE_TTL = 60 * 1000; // 60 seconds
+// Detected/third-party feeds: short TTL so genuine updates are picked up quickly
+const FEED_CACHE_TTL = 60 * 1000; // 60s
+// Known WoCo registry feeds: long TTL — startup pre-warm + per-deploy refresh handles updates,
+// so user requests never pay bee's ~3s cold feed-resolve cost.
+const FEED_REGISTRY_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
 
-/**
- * Get cached content reference for a feed manifest, or null if not cached/expired
- */
 function getCachedFeedContent(manifestHash: string): string | null {
   const cached = FEED_CONTENT_CACHE.get(manifestHash);
   if (cached && cached.expires > Date.now()) {
@@ -59,14 +64,34 @@ function getCachedFeedContent(manifestHash: string): string | null {
   return null;
 }
 
-/**
- * Cache a resolved feed content reference
- */
 function cacheFeedContent(manifestHash: string, contentRef: string): void {
+  const ttl = manifestHash.toLowerCase() in FEED_MANIFEST_REGISTRY
+    ? FEED_REGISTRY_CACHE_TTL
+    : FEED_CACHE_TTL;
   FEED_CONTENT_CACHE.set(manifestHash, {
     contentRef,
-    expires: Date.now() + FEED_CACHE_TTL
+    expires: Date.now() + ttl
   });
+}
+
+// Pre-warm the registry feed cache at startup so the first user after restart
+// never pays bee's ~3s cold feed-resolve cost. Fire-and-forget per feed.
+async function prewarmRegistryFeeds(): Promise<void> {
+  const entries = Object.entries(FEED_MANIFEST_REGISTRY);
+  console.log(`Pre-warming feed cache for ${entries.length} registry feeds...`);
+  await Promise.all(entries.map(async ([manifestHash, info]) => {
+    try {
+      const contentRef = await resolveFeed(info.owner, info.topic);
+      if (contentRef) {
+        cacheFeedContent(manifestHash, contentRef);
+        console.log(`  warmed ${manifestHash} -> ${contentRef}`);
+      } else {
+        console.log(`  WARN: failed to resolve ${manifestHash} during pre-warm`);
+      }
+    } catch (err) {
+      console.log(`  WARN: pre-warm error for ${manifestHash}:`, err);
+    }
+  }));
 }
 
 /**
@@ -135,45 +160,24 @@ async function detectFeedManifest(hash: string): Promise<{ owner: string; topic:
  * @returns The content reference or null if not found
  */
 async function resolveFeed(owner: string, topic: string): Promise<string | null> {
+  // Bee returns the resolved content reference in the `etag` header on
+  // GET /feeds/{owner}/{topic}. This is the canonical, documented field.
+  // The body bytes encode the SOC payload (timestamp + reference + padding)
+  // whose layout has historically been mis-parsed by hand-sliced offsets.
   try {
     const feedUrl = `${beeApiUrl}/feeds/${owner}/${topic}`;
-    console.log(`Resolving feed: ${feedUrl}`);
     const response = await fetchWithTimeout(feedUrl);
-    if (response.ok) {
-      // Feed endpoint returns binary data, not text
-      // Format: varies by payload, but reference is typically after initial bytes
-      const buffer = await response.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-
-      console.log(`Feed response: ${bytes.length} bytes`);
-
-      // Look for 32-byte reference in the response
-      // The feed chunk payload starts with padding/timestamp, then the reference
-      // Based on observed data, reference starts at offset 32 (after 32 bytes of padding)
-      if (bytes.length >= 64) {
-        const refBytes = bytes.slice(32, 64);
-        const refHex = Array.from(refBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-
-        // Verify it looks like a valid reference (not all zeros)
-        if (!/^0+$/.test(refHex)) {
-          console.log(`Feed resolved to reference: ${refHex}`);
-          return refHex;
-        }
-      }
-
-      // Fallback: try to find a 64-char hex string in the response
-      const text = new TextDecoder().decode(bytes);
-      const hexMatch = text.match(/[a-f0-9]{64}/i);
-      if (hexMatch) {
-        console.log(`Feed resolved to reference (text match): ${hexMatch[0]}`);
-        return hexMatch[0].toLowerCase();
-      }
-
-      console.log(`Could not extract reference from feed response`);
-      console.log(`First 100 bytes hex: ${Array.from(bytes.slice(0, 100)).map(b => b.toString(16).padStart(2, '0')).join('')}`);
+    if (!response.ok) {
+      console.log(`Feed resolution failed with status: ${response.status}`);
       return null;
     }
-    console.log(`Feed resolution failed with status: ${response.status}`);
+    // Drain body so the connection can be reused
+    await response.arrayBuffer();
+    const etag = response.headers.get('etag')?.replace(/"/g, '') ?? '';
+    if (/^[0-9a-f]{64}$/i.test(etag)) {
+      return etag.toLowerCase();
+    }
+    console.log(`Feed resolve: missing or malformed etag header: ${etag}`);
     return null;
   } catch (error) {
     console.error('Feed resolution error:', error);
@@ -260,14 +264,36 @@ app.set('trust proxy', 1);
 
 // Helper function to check if request is from localhost/local network
 function isLocalRequest(req: Request): boolean {
-  const ip = req.ip || req.socket.remoteAddress || '';
-  // Check for localhost variants and local network
-  return ip === '127.0.0.1' ||
-         ip === '::1' ||
-         ip === '::ffff:127.0.0.1' ||
-         ip.startsWith('192.168.') ||
-         ip.startsWith('10.') ||
-         ip.startsWith('172.');
+  const raw = req.ip || req.socket.remoteAddress || '';
+  // NORMALISE THE IPv4-MAPPED IPv6 FORM FIRST. This listener is dual-stack
+  // (`app.listen(port)` binds `:::3000`), so Node presents an IPv4 peer as
+  // `::ffff:172.18.0.3`. The localhost arm below was written knowing that —
+  // it spells out `::ffff:127.0.0.1` — but the PRIVATE-RANGE arms were not,
+  // so `startsWith('172.')` never matched and every in-cluster Docker call
+  // read as REMOTE and fell under the rate limiters.
+  //
+  // Measured 2026-08-20 (WoCo #332): the API server calls this proxy at
+  // http://bee-proxy:3000 from 172.18.0.3 and was being rate-limited anyway —
+  // `ratelimit-limit: 1000` came back on an in-cluster probe, proving the skip
+  // never fired. Its SOC whitelist calls then 429'd against the 50-per-15-min
+  // admin cap, ~50 failures in 6 hours, each swallowed by the caller. Freshly
+  // written chunks were left unwhitelisted and 403'd on read until a
+  // server-fallback read repaired them one at a time.
+  const ip = raw.startsWith('::ffff:') ? raw.slice('::ffff:'.length) : raw;
+
+  if (ip === '127.0.0.1' || ip === '::1') return true;
+  if (ip.startsWith('192.168.') || ip.startsWith('10.')) return true;
+  // 172.16.0.0/12 is the actual private block — 172.16.x to 172.31.x. The old
+  // bare `startsWith('172.')` also exempted PUBLIC 172.x space (e.g. 172.217.x
+  // is Google), which widened the exemption well past the intent. Docker's
+  // default bridge pools sit inside 172.16/12, so this still covers the case
+  // it exists for.
+  const m = /^172\.(\d{1,3})\./.exec(ip);
+  if (m) {
+    const second = Number(m[1]);
+    return second >= 16 && second <= 31;
+  }
+  return false;
 }
 
 // Rate limiting configuration
@@ -281,10 +307,12 @@ const generalLimiter = rateLimit({
   skip: (req: Request) => isLocalRequest(req), // Skip rate limiting for local requests
 });
 
-// Strict rate limit for uploads - 300 requests per hour per IP (increased for POD collectibles)
+// Upload rate limit - 2000 requests per hour per IP
+// Event creation needs: N ticket uploads + metadata + image + feed writes
+// A 500-ticket event needs ~510 requests, so 2000 gives comfortable headroom
 const uploadLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
-  max: 300, // Limit uploads to prevent abuse (allows up to 300-edition collectibles)
+  max: 2000,
   message: 'Too many upload requests, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
@@ -301,12 +329,28 @@ const adminLimiter = rateLimit({
   skip: (req: Request) => isLocalRequest(req), // Skip rate limiting for local requests
 });
 
+// Upload secret — required on all write endpoints for non-local requests.
+// Local requests (127.x from SSH tunnel, 172.x from Docker server) are exempt.
+// Set UPLOAD_SECRET env var on the server; leave unset for local dev.
+const uploadSecret = process.env.UPLOAD_SECRET || '';
+
+function requireUploadSecret(req: Request, res: Response, next: NextFunction): void {
+  if (!uploadSecret) { next(); return; } // dev: no secret set, allow all
+  if (req.headers['x-upload-secret'] !== uploadSecret) {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+  next();
+}
+
 // CORS middleware - allow all origins (must be BEFORE body parsers)
 app.use((_req: Request, res: Response, next: NextFunction) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, swarm-postage-batch-id, swarm-deferred-upload, swarm-redundancy-level');
-  res.setHeader('Access-Control-Expose-Headers', 'swarm-tag, etag');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-upload-secret, swarm-postage-batch-id, swarm-deferred-upload, swarm-redundancy-level, swarm-encrypt, swarm-index-document, swarm-error-document, swarm-collection, swarm-pin, swarm-tag');
+  // X-Chunk-Gate must be exposed or a browser cannot read it at all (CORS
+  // hides every non-safelisted response header by default).
+  res.setHeader('Access-Control-Expose-Headers', 'swarm-tag, etag, X-Chunk-Gate');
   if (_req.method === 'OPTIONS') {
     res.sendStatus(200);
     return;
@@ -345,7 +389,9 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // Logging middleware
 app.use((req: Request, _res: Response, next: NextFunction) => {
   const timestamp = new Date().toISOString();
-  const logMessage = `${timestamp} - ${req.method} ${req.path}`;
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const isLocal = isLocalRequest(req);
+  const logMessage = `${timestamp} - ${req.method} ${req.path} [ip=${ip} local=${isLocal}]`;
   console.log(logMessage);
   next();
 });
@@ -379,7 +425,7 @@ app.get('/stamps', async (_req: Request, res: Response) => {
  * Buy a new postage stamp
  * POST /stamps/:amount/:depth
  */
-app.post('/stamps/:amount/:depth', adminLimiter, async (req: Request, res: Response) => {
+app.post('/stamps/:amount/:depth', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
   const { amount, depth } = req.params;
 
   try {
@@ -418,7 +464,7 @@ app.post('/stamps/:amount/:depth', adminLimiter, async (req: Request, res: Respo
 /**
  * Top up a postage batch
  */
-app.patch('/stamps/topup/:batchId/:amount', adminLimiter, async (req: Request, res: Response) => {
+app.patch('/stamps/topup/:batchId/:amount', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
   const { batchId, amount } = req.params;
 
   try {
@@ -456,7 +502,7 @@ app.patch('/stamps/topup/:batchId/:amount', adminLimiter, async (req: Request, r
  * PATCH /stamps/dilute/:batchId/:depth
  * Note: Dilution is irreversible and halves TTL for each depth increase
  */
-app.patch('/stamps/dilute/:batchId/:depth', adminLimiter, async (req: Request, res: Response) => {
+app.patch('/stamps/dilute/:batchId/:depth', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
   const { batchId, depth } = req.params;
 
   try {
@@ -493,7 +539,7 @@ app.patch('/stamps/dilute/:batchId/:depth', adminLimiter, async (req: Request, r
  * Upload endpoint for posting content to Swarm
  * Automatically whitelists the returned hash
  */
-app.post('/bzz', uploadLimiter, async (req: Request, res: Response) => {
+app.post('/bzz', requireUploadSecret, uploadLimiter, async (req: Request, res: Response) => {
   try {
     const contentType = req.headers['content-type'] ?? 'application/octet-stream';
     const swarmPostageBatchId = req.headers['swarm-postage-batch-id'] as string;
@@ -529,7 +575,12 @@ app.post('/bzz', uploadLimiter, async (req: Request, res: Response) => {
     const swarmHeaders = [
       { incoming: 'swarm-index-document', outgoing: 'swarm-index-document' },
       { incoming: 'swarm-error-document', outgoing: 'swarm-error-document' },
-      { incoming: 'swarm-collection', outgoing: 'swarm-collection' }
+      { incoming: 'swarm-collection', outgoing: 'swarm-collection' },
+      { incoming: 'swarm-redundancy-level', outgoing: 'swarm-redundancy-level' },
+      { incoming: 'swarm-encrypt', outgoing: 'swarm-encrypt' },
+      { incoming: 'swarm-deferred-upload', outgoing: 'swarm-deferred-upload' },
+      { incoming: 'swarm-pin', outgoing: 'swarm-pin' },
+      { incoming: 'swarm-tag', outgoing: 'swarm-tag' }
     ];
     for (const { incoming, outgoing } of swarmHeaders) {
       const value = req.headers[incoming] || req.headers[incoming.toLowerCase()];
@@ -580,7 +631,7 @@ app.post('/bzz', uploadLimiter, async (req: Request, res: Response) => {
  * POST /bytes endpoint for uploading raw bytes
  * Automatically whitelists the returned hash
  */
-app.post('/bytes', uploadLimiter, async (req: Request, res: Response) => {
+app.post('/bytes', requireUploadSecret, uploadLimiter, async (req: Request, res: Response) => {
   try {
     const contentType = req.headers['content-type'] ?? 'application/octet-stream';
     const swarmPostageBatchId = req.headers['swarm-postage-batch-id'] as string;
@@ -595,13 +646,28 @@ app.post('/bytes', uploadLimiter, async (req: Request, res: Response) => {
 
     console.log(`Uploading bytes with batch ID: ${swarmPostageBatchId}`);
 
-    // Forward the upload to bee node
+    const bytesForwardHeaders: Record<string, string> = {
+      'Content-Type': contentType,
+      'swarm-postage-batch-id': swarmPostageBatchId,
+    };
+    const bytesPassthrough = [
+      'swarm-redundancy-level',
+      'swarm-encrypt',
+      'swarm-deferred-upload',
+      'swarm-pin',
+      'swarm-tag',
+    ];
+    for (const h of bytesPassthrough) {
+      const v = req.headers[h] || req.headers[h.toLowerCase()];
+      if (v) {
+        bytesForwardHeaders[h] = String(v);
+        console.log(`Forwarding header: ${h} = ${v}`);
+      }
+    }
+
     const uploadResponse = await fetchWithTimeout(`${beeApiUrl}/bytes`, {
       method: 'POST',
-      headers: {
-        'Content-Type': contentType,
-        'swarm-postage-batch-id': swarmPostageBatchId,
-      },
+      headers: bytesForwardHeaders,
       body: req.body as Buffer
     });
 
@@ -644,7 +710,10 @@ app.post('/bytes', uploadLimiter, async (req: Request, res: Response) => {
  * 2. Known feed manifest in registry + allowed owner (instant)
  * 3. Auto-detect feed manifest + allowed owner (one-time network request, then cached)
  */
-async function isHashAllowed(hash: string): Promise<boolean> {
+async function isHashAllowed(
+  hash: string,
+  opts: { detectManifests?: boolean } = {},
+): Promise<boolean> {
   const normalizedHash = hash.toLowerCase();
 
   // Fast path 1: Check whitelist
@@ -657,6 +726,14 @@ async function isHashAllowed(hash: string): Promise<boolean> {
   if (knownFeedInfo && ALLOWED_FEED_OWNERS.has(knownFeedInfo.owner.toLowerCase())) {
     console.log(`Feed manifest ${hash} allowed via registry + ALLOWED_FEED_OWNERS`);
     return true;
+  }
+
+  // OPT-OUT for callers that can never be asking about a feed manifest. The
+  // detection below is a full bee lookup, and on the SOC version-probe path it
+  // runs against a stream of never-seen addresses — so the caller pays seconds
+  // to be told "no" about something it never asked. See the /chunks call site.
+  if (opts.detectManifests === false) {
+    return false;
   }
 
   // Slow path: Try to detect if this is a feed manifest from an allowed owner
@@ -716,6 +793,72 @@ app.get('/bytes/:hash', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /chunks/:hash — raw chunk passthrough.
+ *
+ * Needed by the WoCo server when writing site-pointer feeds in modern
+ * (inline) SOC form: it fetches the just-uploaded root manifest's raw
+ * chunk bytes and embeds them as the SOC payload, so anonymous /bzz
+ * resolution works on Beehive (Etherna) which dropped legacy SOC support.
+ *
+ * Whitelist-gated like /bytes — only chunks of already-public hashes are
+ * served. Internal caller (events-api) hits this immediately after a /bzz
+ * upload that auto-whitelisted the hash.
+ */
+app.get('/chunks/:hash', async (req: Request, res: Response) => {
+  const hash = req.params.hash;
+
+  if (!(await isHashAllowed(hash, { detectManifests: false }))) {
+    // detectManifests:false — a /chunks request is a raw chunk read, and the
+    // WoCo client uses it only for SOCs, whose address is keccak(identifier||owner)
+    // and can never be a feed manifest. Running the manifest probe here cost a
+    // full bee lookup per never-seen address: measured 2026-08-20 at ~2.76s for a
+    // novel hash and ~0.15s once NOT_FEED_MANIFEST_CACHE had it. The SOC version
+    // scan asks about novel addresses constantly, so that slow path was on the
+    // hot path of every read. Known manifests still resolve here via the registry
+    // fast path above, which is a dictionary lookup with no network.
+    console.warn(`Blocked access to non-whitelisted chunk: ${hash}`);
+    // SELF-IDENTIFYING DENIAL. A bare 403 is ambiguous — Cloudflare, a WAF, or
+    // any intermediary can produce one — so a client must never read "403" as
+    // "this chunk does not exist". Tagging OUR gate lets a reader distinguish
+    // "the gate refused, and the gate is authoritative about what exists here"
+    // from "somebody upstream said no", and only trust the former. The header
+    // is for well-behaved clients; the body `code` is what survives libraries
+    // that surface an error body but not headers.
+    res.setHeader('X-Chunk-Gate', 'not-whitelisted');
+    res.status(403).json({
+      error: 'Access denied',
+      code: 'NOT_WHITELISTED',
+      message: 'This hash is not whitelisted'
+    });
+    return;
+  }
+
+  try {
+    const url = `${beeApiUrl}/chunks/${hash}`;
+    const response = await fetchWithTimeout(url);
+
+    response.headers.forEach((value, key) => {
+      res.setHeader(key, value);
+    });
+    res.status(response.status);
+
+    if (response.body) {
+      const reader = response.body.getReader();
+      await streamWithTimeout(reader, res);
+    } else {
+      res.end();
+    }
+  } catch (error) {
+    console.error('Error proxying /chunks request:', error);
+    const statusCode = (error as Error).message.includes('timeout') ? 504 : 502;
+    res.status(statusCode).json({
+      error: statusCode === 504 ? 'Gateway timeout' : 'Bad gateway',
+      message: (error as Error).message
+    });
+  }
+});
+
+/**
  * GET /feeds/:owner/:topic endpoint for reading Swarm feeds
  * Feeds are public and don't require whitelisting
  * They are used to retrieve feed updates which contain references to actual content
@@ -759,7 +902,7 @@ app.get('/feeds/:owner/:topic', async (req: Request, res: Response) => {
  * Creates a manifest that always resolves to the latest feed update
  * Used for ENS and other permanent addressing scenarios
  */
-app.post('/feeds', uploadLimiter, async (req: Request, res: Response) => {
+app.post('/feeds', requireUploadSecret, uploadLimiter, async (req: Request, res: Response) => {
   try {
     const swarmPostageBatchId = req.headers['swarm-postage-batch-id'] as string;
 
@@ -831,7 +974,7 @@ app.post('/feeds', uploadLimiter, async (req: Request, res: Response) => {
  * POST /feeds/:owner/:topic endpoint for updating Swarm feeds
  * This allows users to update their own feeds
  */
-app.post('/feeds/:owner/:topic', uploadLimiter, async (req: Request, res: Response) => {
+app.post('/feeds/:owner/:topic', requireUploadSecret, uploadLimiter, async (req: Request, res: Response) => {
   const { owner, topic } = req.params;
 
   try {
@@ -928,6 +1071,7 @@ app.post('/feeds/:owner/:topic', uploadLimiter, async (req: Request, res: Respon
  * Public access - no whitelist check needed for writing
  */
 app.post('/soc/:owner/:id',
+  requireUploadSecret,
   uploadLimiter,
   express.raw({ type: '*/*', limit: '50mb' }), // Route-level raw body parser
   async (req: Request, res: Response) => {
@@ -1097,6 +1241,41 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
       return;
     }
 
+    // Fast path for known registry feed manifests: skip the slow /bzz manifest
+    // walk and resolve via /feeds + etag directly. Cache for 60s. The /bzz
+    // path on bee can take seconds because manifest trie nodes may need
+    // network retrieval on a cold or restarted node; /feeds + content-ref
+    // fetch is consistently faster once the content chunks are local.
+    const knownFeedInfo = FEED_MANIFEST_REGISTRY[hash.toLowerCase()];
+    if (knownFeedInfo && ALLOWED_FEED_OWNERS.has(knownFeedInfo.owner.toLowerCase())) {
+      const contentRef = await resolveFeed(knownFeedInfo.owner, knownFeedInfo.topic);
+      if (contentRef) {
+        cacheFeedContent(hash, contentRef);
+        if (!whitelist.isWhitelisted(contentRef)) {
+          await whitelist.add(contentRef);
+        }
+        const proxyUrl = subpath
+          ? `${beeApiUrl}/bzz/${contentRef}/${subpath}`
+          : `${beeApiUrl}/bzz/${contentRef}/`;
+        console.log(`Registry fast-path: ${hash} -> ${contentRef} (${proxyUrl})`);
+
+        const contentResponse = await fetchWithTimeout(proxyUrl);
+        contentResponse.headers.forEach((value, key) => {
+          res.setHeader(key, value);
+        });
+        res.status(contentResponse.status);
+        if (contentResponse.body) {
+          const reader = contentResponse.body.getReader();
+          await streamWithTimeout(reader, res);
+        } else {
+          res.end();
+        }
+        return;
+      }
+      // Resolution failed — fall through to legacy /bzz path
+      console.log(`Registry fast-path failed for ${hash}, falling back to /bzz`);
+    }
+
     // Build URL with subpath if present
     const url = subpath
       ? `${beeApiUrl}/bzz/${hash}/${subpath}`
@@ -1191,7 +1370,7 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
 /**
  * Get all whitelisted hashes
  */
-app.get('/admin/whitelist', adminLimiter, (_req: Request, res: Response) => {
+app.get('/admin/whitelist', requireUploadSecret, adminLimiter, (_req: Request, res: Response) => {
   res.json({
     hashes: whitelist.getAll(),
     count: whitelist.count()
@@ -1201,7 +1380,7 @@ app.get('/admin/whitelist', adminLimiter, (_req: Request, res: Response) => {
 /**
  * Add a hash to the whitelist
  */
-app.post('/admin/whitelist', adminLimiter, async (req: Request, res: Response) => {
+app.post('/admin/whitelist', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
   const { hash, hashes } = req.body as { hash?: string; hashes?: string[] };
 
   try {
@@ -1237,7 +1416,7 @@ app.post('/admin/whitelist', adminLimiter, async (req: Request, res: Response) =
 /**
  * Remove a hash from the whitelist
  */
-app.delete('/admin/whitelist/:hash', adminLimiter, async (req: Request, res: Response) => {
+app.delete('/admin/whitelist/:hash', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
   const hash = req.params.hash;
 
   try {
@@ -1259,7 +1438,7 @@ app.delete('/admin/whitelist/:hash', adminLimiter, async (req: Request, res: Res
 /**
  * Clear the entire whitelist
  */
-app.delete('/admin/whitelist', adminLimiter, async (_req: Request, res: Response) => {
+app.delete('/admin/whitelist', requireUploadSecret, adminLimiter, async (_req: Request, res: Response) => {
   try {
     await whitelist.clear();
     res.json({
@@ -1280,6 +1459,9 @@ async function start(): Promise<void> {
   try {
     await whitelist.initialize();
 
+    // Pre-warm feed cache so first user request after restart hits cache, not bee's ~3s cold path
+    await prewarmRegistryFeeds();
+
     // Wrap app.listen in a Promise to ensure it completes
     await new Promise<void>((resolve, reject) => {
       const server = app.listen(port, () => {
@@ -1288,7 +1470,7 @@ async function start(): Promise<void> {
         console.log(`Whitelist size: ${whitelist.count()}`);
         console.log('Rate limiting enabled:');
         console.log('  - General: 1000 req/1min per IP');
-        console.log('  - Uploads: 300 req/1hour per IP');
+        console.log('  - Uploads: 2000 req/1hour per IP');
         console.log('  - Admin: 50 req/15min per IP');
         resolve();
       });

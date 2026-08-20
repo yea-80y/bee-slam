@@ -52,3 +52,10 @@ temp/
 *_backup.*
 *_old*.*
 *_new*.*
+
+# Proxy runtime state. whitelist.json is DATA-PLANE state, not config: the
+# gateway serves only the addresses it lists, and since a client may now treat
+# a whitelist refusal as "this chunk does not exist" (X-Chunk-Gate), losing or
+# overwriting it makes real chunks read as absent. An empty stub committed here
+# is a path to deploying one over a real one - never track it.
+proxy/data/
