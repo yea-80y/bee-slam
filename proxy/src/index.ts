@@ -189,6 +189,13 @@ async function resolveFeed(owner: string, topic: string): Promise<string | null>
 // This prevents requests from hanging when bee-node is slow/unresponsive
 // and ensures we fail gracefully before Cloudflare's 30-second timeout
 const BEE_REQUEST_TIMEOUT = 15000;
+// Uploads need their own, much larger budget. bee blocks a non-deferred upload
+// until the whole collection is PUSHED TO THE NETWORK, which for a multi-MB tar
+// is tens of seconds — so the 15s read timeout above silently made large uploads
+// impossible. Measured 2026-08-20: the WoCo frontend deploy (a ~10MB collection)
+// failed with "bee node took longer than 15000ms", and organiser site publishes
+// go through the same /bzz path.
+const BEE_UPLOAD_TIMEOUT = 180000;
 
 /**
  * Helper function to create a fetch request with timeout
@@ -594,7 +601,7 @@ app.post('/bzz', requireUploadSecret, uploadLimiter, async (req: Request, res: R
       method: 'POST',
       headers: forwardHeaders,
       body: req.body as Buffer
-    });
+    }, BEE_UPLOAD_TIMEOUT);
 
     if (!uploadResponse.ok) {
       const errorText = await uploadResponse.text();
@@ -669,7 +676,7 @@ app.post('/bytes', requireUploadSecret, uploadLimiter, async (req: Request, res:
       method: 'POST',
       headers: bytesForwardHeaders,
       body: req.body as Buffer
-    });
+    }, BEE_UPLOAD_TIMEOUT);
 
     if (!uploadResponse.ok) {
       const errorText = await uploadResponse.text();
