@@ -3,6 +3,7 @@ import rateLimit from 'express-rate-limit';
 import { gunzipSync } from 'zlib';
 import { WhitelistManager } from './whitelist.js';
 import { FeedCache, SEEDED_FEED_MANIFESTS, isManifestHash, refreshFeedManifest } from './feed-cache.js';
+import { secretMatches } from './upload-secret.js';
 
 const app = express();
 const port = process.env.PORT ?? 3000;
@@ -280,7 +281,9 @@ const uploadLimiter = rateLimit({
   skip: (req: Request) => isLocalRequest(req), // Skip rate limiting for local requests
 });
 
-// Admin endpoint rate limit - 50 requests per 15 minutes per IP
+// Admin endpoint rate limit - 50 requests per 15 minutes per IP. Placed BEFORE
+// requireUploadSecret on every admin route, so a wrong secret is counted too:
+// guessing it costs the same budget as using it.
 const adminLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 50,
@@ -290,14 +293,15 @@ const adminLimiter = rateLimit({
   skip: (req: Request) => isLocalRequest(req), // Skip rate limiting for local requests
 });
 
-// Upload secret — required on all write endpoints for non-local requests.
-// Local requests (127.x from SSH tunnel, 172.x from Docker server) are exempt.
-// Set UPLOAD_SECRET env var on the server; leave unset for local dev.
+// Upload secret — required on every write and admin route, from EVERY caller:
+// local requests are exempt from the rate limiters only, never from this, so
+// the in-cluster WoCo server sends it too. Set UPLOAD_SECRET on the server;
+// leave it unset for local dev.
 const uploadSecret = process.env.UPLOAD_SECRET || '';
 
 function requireUploadSecret(req: Request, res: Response, next: NextFunction): void {
   if (!uploadSecret) { next(); return; } // dev: no secret set, allow all
-  if (req.headers['x-upload-secret'] !== uploadSecret) {
+  if (!secretMatches(req.headers['x-upload-secret'], uploadSecret)) {
     res.status(403).json({ error: 'Forbidden' });
     return;
   }
@@ -386,7 +390,7 @@ app.get('/stamps', async (_req: Request, res: Response) => {
  * Buy a new postage stamp
  * POST /stamps/:amount/:depth
  */
-app.post('/stamps/:amount/:depth', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
+app.post('/stamps/:amount/:depth', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const { amount, depth } = req.params;
 
   try {
@@ -425,7 +429,7 @@ app.post('/stamps/:amount/:depth', requireUploadSecret, adminLimiter, async (req
 /**
  * Top up a postage batch
  */
-app.patch('/stamps/topup/:batchId/:amount', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
+app.patch('/stamps/topup/:batchId/:amount', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const { batchId, amount } = req.params;
 
   try {
@@ -463,7 +467,7 @@ app.patch('/stamps/topup/:batchId/:amount', requireUploadSecret, adminLimiter, a
  * PATCH /stamps/dilute/:batchId/:depth
  * Note: Dilution is irreversible and halves TTL for each depth increase
  */
-app.patch('/stamps/dilute/:batchId/:depth', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
+app.patch('/stamps/dilute/:batchId/:depth', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const { batchId, depth } = req.params;
 
   try {
@@ -1334,7 +1338,7 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
 /**
  * Get all whitelisted hashes
  */
-app.get('/admin/whitelist', requireUploadSecret, adminLimiter, (_req: Request, res: Response) => {
+app.get('/admin/whitelist', adminLimiter, requireUploadSecret, (_req: Request, res: Response) => {
   res.json({
     hashes: whitelist.getAll(),
     count: whitelist.count()
@@ -1344,7 +1348,7 @@ app.get('/admin/whitelist', requireUploadSecret, adminLimiter, (_req: Request, r
 /**
  * Add a hash to the whitelist
  */
-app.post('/admin/whitelist', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
+app.post('/admin/whitelist', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const { hash, hashes } = req.body as { hash?: string; hashes?: string[] };
 
   try {
@@ -1380,7 +1384,7 @@ app.post('/admin/whitelist', requireUploadSecret, adminLimiter, async (req: Requ
 /**
  * Remove a hash from the whitelist
  */
-app.delete('/admin/whitelist/:hash', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
+app.delete('/admin/whitelist/:hash', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const hash = req.params.hash;
 
   try {
@@ -1402,7 +1406,7 @@ app.delete('/admin/whitelist/:hash', requireUploadSecret, adminLimiter, async (r
 /**
  * Clear the entire whitelist
  */
-app.delete('/admin/whitelist', requireUploadSecret, adminLimiter, async (_req: Request, res: Response) => {
+app.delete('/admin/whitelist', adminLimiter, requireUploadSecret, async (_req: Request, res: Response) => {
   try {
     await whitelist.clear();
     res.json({
@@ -1426,7 +1430,7 @@ app.delete('/admin/whitelist', requireUploadSecret, adminLimiter, async (_req: R
  * cached ref was dropped but nothing was re-resolved: the hash is unknown to the
  * proxy, its owner is not in ALLOWED_FEED_OWNERS, or bee could not resolve it.
  */
-app.post('/admin/feeds/:hash/refresh', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
+app.post('/admin/feeds/:hash/refresh', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const hash = req.params.hash;
 
   if (!isManifestHash(hash)) {

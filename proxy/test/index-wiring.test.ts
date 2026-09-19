@@ -22,9 +22,36 @@ function routeBody(method: string, path: string): string {
 
 test('the refresh route is guarded exactly like the whitelist admin routes', () => {
   const refresh = guardsOf('post', '/admin/feeds/:hash/refresh');
-  assert.equal(refresh, 'requireUploadSecret, adminLimiter,');
+  assert.equal(refresh, 'adminLimiter, requireUploadSecret,');
   assert.equal(refresh, guardsOf('post', '/admin/whitelist'));
   assert.equal(refresh, guardsOf('delete', '/admin/whitelist/:hash'));
+});
+
+test('every admin route counts the attempt BEFORE it checks the secret', () => {
+  // The other way round, a wrong secret is refused before the limiter sees it,
+  // so guessing costs nothing against the admin budget.
+  const admin = [
+    ['post', '/stamps/:amount/:depth'],
+    ['patch', '/stamps/topup/:batchId/:amount'],
+    ['patch', '/stamps/dilute/:batchId/:depth'],
+    ['post', '/admin/whitelist'],
+    ['delete', '/admin/whitelist/:hash'],
+    ['post', '/admin/feeds/:hash/refresh'],
+  ] as const;
+  for (const [method, path] of admin) {
+    assert.equal(guardsOf(method, path), 'adminLimiter, requireUploadSecret,', `${method} ${path}`);
+  }
+  // The two sync/no-param admin routes, matched loosely (no `async` on the GET).
+  assert.match(source, /app\.get\('\/admin\/whitelist', adminLimiter, requireUploadSecret,/);
+  assert.match(source, /app\.delete\('\/admin\/whitelist', adminLimiter, requireUploadSecret,/);
+  assert.doesNotMatch(source, /requireUploadSecret, adminLimiter/, 'no admin route may check the secret first');
+});
+
+test('the secret is compared in constant time, not with !==', () => {
+  const guard = source.slice(source.indexOf('function requireUploadSecret('), source.indexOf('\n}\n', source.indexOf('function requireUploadSecret(')));
+  assert.match(guard, /secretMatches\(req\.headers\['x-upload-secret'\], uploadSecret\)/);
+  assert.doesNotMatch(guard, /!==\s*uploadSecret|===\s*uploadSecret/);
+  assert.doesNotMatch(source, /172\.x from Docker server\) are exempt/, 'the false exemption comment is gone');
 });
 
 test('the refresh route rejects a malformed hash before touching the cache', () => {
