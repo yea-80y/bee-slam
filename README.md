@@ -190,6 +190,22 @@ curl -X DELETE http://localhost:3000/admin/whitelist/<hash>
 curl -X DELETE http://localhost:3000/admin/whitelist
 ```
 
+### Admin API - Refresh a Feed
+
+A seeded feed manifest's resolved content is cached for 24h, a detected one for 60s.
+After publishing a new version of a feed, drop the cached content and re-resolve it
+now instead of restarting the proxy:
+
+```bash
+curl -X POST http://localhost:3000/admin/feeds/<64-char-manifest-hash>/refresh \
+  -H "x-upload-secret: $UPLOAD_SECRET"
+# {"ok":true,"hash":"<hash>","refreshed":true,"contentRef":"<new content ref>"}
+```
+
+`refreshed: false` (with `contentRef: null`) means the cached content was dropped but
+nothing was re-resolved: the proxy has not seen that feed, its owner is not allowed,
+or bee could not resolve it. A malformed hash answers 400.
+
 ### ENS Integration Test
 
 The proxy includes a test script that resolves ENS names to Swarm hashes:

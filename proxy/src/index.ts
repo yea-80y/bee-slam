@@ -2,6 +2,8 @@ import express, { Request, Response, NextFunction } from 'express';
 import rateLimit from 'express-rate-limit';
 import { gunzipSync } from 'zlib';
 import { WhitelistManager } from './whitelist.js';
+import { FeedCache, SEEDED_FEED_MANIFESTS, isManifestHash, refreshFeedManifest } from './feed-cache.js';
+import { secretMatches } from './upload-secret.js';
 
 const app = express();
 const port = process.env.PORT ?? 3000;
@@ -17,73 +19,25 @@ const ALLOWED_FEED_OWNERS = new Set([
 ]);
 
 // Known feed manifests - when Bee can't resolve these due to missing trie nodes,
-// we fall back to querying the feed directly. This is seeded with known manifests
-// but dynamically populated as new feed manifests are discovered.
-const FEED_MANIFEST_REGISTRY: Record<string, { owner: string; topic: string }> = {
-  // WoCo Events App feed manifest (topic: woco-events-v1) — used by woco.eth.limo
-  'd66c6ff7650a468c2fd98439c8f04547b5b8a4b933d349ff16db1d0b00c23adc': {
-    owner: 'f8af4904c6e4f08ce5f7deab7f01221280b23a80',
-    topic: 'aef7b3bb8b50eff1516536370de7ab15de8e24592a35d2abd9977d00ebb650b2'
-  },
-  // Gateway feed manifest (topic: woco-website-v2)
-  '9ebcea7ca2d4a3a975d1724ee579856684dc6f2ffa3082b64317006c922f3100': {
-    owner: 'f8af4904c6e4f08ce5f7deab7f01221280b23a80',
-    topic: '57d52cda5c8794db2dc1540fde6be327e9d7ea120f8c491eef9f8469e7167568'
-  },
-  // Legacy feed manifest (topic: woco-website)
-  '0b4ea8162a3fcbb19b63705f0c97137eef667d3c3cd4ecf69d686c5f98fb0054': {
-    owner: 'f8af4904c6e4f08ce5f7deab7f01221280b23a80',
-    topic: 'bb6a23bf07aa84a41fe44a485dd811ea10cc57a7cb88257789920813549f81d1'
-  },
-  // ENS feed manifest (topic: woco-ens-2026)
-  'e315d1798ec34cc7137c6b8c79cb28d586d972898fef769cdca08ad13b74d89c': {
-    owner: 'f8af4904c6e4f08ce5f7deab7f01221280b23a80',
-    topic: '20449894e8e4183fc8f0ba08b57e55ca9c0a3d669cab29e1eaf12a4ccc927e0e'
-  }
-};
+// we fall back to querying the feed directly. The seeded manifests live in
+// feed-cache.ts; manifests detected at runtime are registered here for owner/topic
+// lookup only. feed-cache.ts also owns the content-ref cache and decides every TTL:
+// 24h for a seeded manifest, 60s for everything else and for the /bzz 404 fallback.
+const feedCache = new FeedCache();
 
 // Cache for hashes we've checked that are NOT feed manifests (to avoid repeated checks)
 const NOT_FEED_MANIFEST_CACHE = new Set<string>();
 
-// Cache for resolved feed content references (feed manifest hash -> content ref)
-const FEED_CONTENT_CACHE: Map<string, { contentRef: string; expires: number }> = new Map();
-// Detected/third-party feeds: short TTL so genuine updates are picked up quickly
-const FEED_CACHE_TTL = 60 * 1000; // 60s
-// Known WoCo registry feeds: long TTL — startup pre-warm + per-deploy refresh handles updates,
-// so user requests never pay bee's ~3s cold feed-resolve cost.
-const FEED_REGISTRY_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
-
-function getCachedFeedContent(manifestHash: string): string | null {
-  const cached = FEED_CONTENT_CACHE.get(manifestHash);
-  if (cached && cached.expires > Date.now()) {
-    return cached.contentRef;
-  }
-  if (cached) {
-    FEED_CONTENT_CACHE.delete(manifestHash);
-  }
-  return null;
-}
-
-function cacheFeedContent(manifestHash: string, contentRef: string): void {
-  const ttl = manifestHash.toLowerCase() in FEED_MANIFEST_REGISTRY
-    ? FEED_REGISTRY_CACHE_TTL
-    : FEED_CACHE_TTL;
-  FEED_CONTENT_CACHE.set(manifestHash, {
-    contentRef,
-    expires: Date.now() + ttl
-  });
-}
-
-// Pre-warm the registry feed cache at startup so the first user after restart
+// Pre-warm the seeded feed cache at startup so the first user after restart
 // never pays bee's ~3s cold feed-resolve cost. Fire-and-forget per feed.
 async function prewarmRegistryFeeds(): Promise<void> {
-  const entries = Object.entries(FEED_MANIFEST_REGISTRY);
+  const entries = Object.entries(SEEDED_FEED_MANIFESTS);
   console.log(`Pre-warming feed cache for ${entries.length} registry feeds...`);
   await Promise.all(entries.map(async ([manifestHash, info]) => {
     try {
       const contentRef = await resolveFeed(info.owner, info.topic);
       if (contentRef) {
-        cacheFeedContent(manifestHash, contentRef);
+        feedCache.set(manifestHash, contentRef);
         console.log(`  warmed ${manifestHash} -> ${contentRef}`);
       } else {
         console.log(`  WARN: failed to resolve ${manifestHash} during pre-warm`);
@@ -107,8 +61,9 @@ async function detectFeedManifest(hash: string): Promise<{ owner: string; topic:
   }
 
   // Already known feed manifest
-  if (hash in FEED_MANIFEST_REGISTRY) {
-    return FEED_MANIFEST_REGISTRY[hash];
+  const known = feedCache.lookup(hash);
+  if (known) {
+    return known;
   }
 
   try {
@@ -139,8 +94,8 @@ async function detectFeedManifest(hash: string): Promise<{ owner: string; topic:
       };
       console.log(`Detected feed manifest! Owner: ${feedInfo.owner}, Topic: ${feedInfo.topic}`);
 
-      // Cache for future use
-      FEED_MANIFEST_REGISTRY[hash] = feedInfo;
+      // Cache for future use (owner/topic lookup only - never lengthens a TTL)
+      feedCache.registerDetected(hash, feedInfo);
       return feedInfo;
     }
 
@@ -326,7 +281,9 @@ const uploadLimiter = rateLimit({
   skip: (req: Request) => isLocalRequest(req), // Skip rate limiting for local requests
 });
 
-// Admin endpoint rate limit - 50 requests per 15 minutes per IP
+// Admin endpoint rate limit - 50 requests per 15 minutes per IP. Placed BEFORE
+// requireUploadSecret on every admin route, so a wrong secret is counted too:
+// guessing it costs the same budget as using it.
 const adminLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 50,
@@ -336,14 +293,15 @@ const adminLimiter = rateLimit({
   skip: (req: Request) => isLocalRequest(req), // Skip rate limiting for local requests
 });
 
-// Upload secret — required on all write endpoints for non-local requests.
-// Local requests (127.x from SSH tunnel, 172.x from Docker server) are exempt.
-// Set UPLOAD_SECRET env var on the server; leave unset for local dev.
+// Upload secret — required on every write and admin route, from EVERY caller:
+// local requests are exempt from the rate limiters only, never from this, so
+// the in-cluster WoCo server sends it too. Set UPLOAD_SECRET on the server;
+// leave it unset for local dev.
 const uploadSecret = process.env.UPLOAD_SECRET || '';
 
 function requireUploadSecret(req: Request, res: Response, next: NextFunction): void {
   if (!uploadSecret) { next(); return; } // dev: no secret set, allow all
-  if (req.headers['x-upload-secret'] !== uploadSecret) {
+  if (!secretMatches(req.headers['x-upload-secret'], uploadSecret)) {
     res.status(403).json({ error: 'Forbidden' });
     return;
   }
@@ -432,7 +390,7 @@ app.get('/stamps', async (_req: Request, res: Response) => {
  * Buy a new postage stamp
  * POST /stamps/:amount/:depth
  */
-app.post('/stamps/:amount/:depth', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
+app.post('/stamps/:amount/:depth', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const { amount, depth } = req.params;
 
   try {
@@ -471,7 +429,7 @@ app.post('/stamps/:amount/:depth', requireUploadSecret, adminLimiter, async (req
 /**
  * Top up a postage batch
  */
-app.patch('/stamps/topup/:batchId/:amount', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
+app.patch('/stamps/topup/:batchId/:amount', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const { batchId, amount } = req.params;
 
   try {
@@ -509,7 +467,7 @@ app.patch('/stamps/topup/:batchId/:amount', requireUploadSecret, adminLimiter, a
  * PATCH /stamps/dilute/:batchId/:depth
  * Note: Dilution is irreversible and halves TTL for each depth increase
  */
-app.patch('/stamps/dilute/:batchId/:depth', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
+app.patch('/stamps/dilute/:batchId/:depth', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const { batchId, depth } = req.params;
 
   try {
@@ -729,7 +687,7 @@ async function isHashAllowed(
   }
 
   // Fast path 2: Check if it's a known feed manifest from an allowed owner
-  const knownFeedInfo = FEED_MANIFEST_REGISTRY[normalizedHash];
+  const knownFeedInfo = feedCache.lookup(normalizedHash);
   if (knownFeedInfo && ALLOWED_FEED_OWNERS.has(knownFeedInfo.owner.toLowerCase())) {
     console.log(`Feed manifest ${hash} allowed via registry + ALLOWED_FEED_OWNERS`);
     return true;
@@ -1226,7 +1184,7 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
 
   try {
     // Fast path: check if we have a cached feed content reference for this hash
-    const cachedContentRef = getCachedFeedContent(hash);
+    const cachedContentRef = feedCache.get(hash);
     if (cachedContentRef) {
       const proxyUrl = subpath
         ? `${beeApiUrl}/bzz/${cachedContentRef}/${subpath}`
@@ -1249,15 +1207,16 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
     }
 
     // Fast path for known registry feed manifests: skip the slow /bzz manifest
-    // walk and resolve via /feeds + etag directly. Cache for 60s. The /bzz
-    // path on bee can take seconds because manifest trie nodes may need
+    // walk and resolve via /feeds + etag directly. Cached for 24h if the
+    // manifest is seeded, 60s if it was detected. The /bzz path on bee can
+    // take seconds because manifest trie nodes may need
     // network retrieval on a cold or restarted node; /feeds + content-ref
     // fetch is consistently faster once the content chunks are local.
-    const knownFeedInfo = FEED_MANIFEST_REGISTRY[hash.toLowerCase()];
+    const knownFeedInfo = feedCache.lookup(hash);
     if (knownFeedInfo && ALLOWED_FEED_OWNERS.has(knownFeedInfo.owner.toLowerCase())) {
       const contentRef = await resolveFeed(knownFeedInfo.owner, knownFeedInfo.topic);
       if (contentRef) {
-        cacheFeedContent(hash, contentRef);
+        feedCache.set(hash, contentRef);
         if (!whitelist.isWhitelisted(contentRef)) {
           await whitelist.add(contentRef);
         }
@@ -1304,8 +1263,10 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
           const contentRef = await resolveFeed(feedInfo.owner, feedInfo.topic);
 
           if (contentRef) {
-            // Cache the resolved content reference for faster subsequent requests
-            cacheFeedContent(hash, contentRef);
+            // Cache the resolved content reference for faster subsequent requests.
+            // viaFallback caps this at 60s even for a seeded manifest: this path
+            // only runs when bee could not walk the manifest, i.e. bee is unhealthy.
+            feedCache.set(hash, contentRef, { viaFallback: true });
 
             // Whitelist the content reference so subpath requests work
             if (!whitelist.isWhitelisted(contentRef)) {
@@ -1377,7 +1338,7 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
 /**
  * Get all whitelisted hashes
  */
-app.get('/admin/whitelist', requireUploadSecret, adminLimiter, (_req: Request, res: Response) => {
+app.get('/admin/whitelist', adminLimiter, requireUploadSecret, (_req: Request, res: Response) => {
   res.json({
     hashes: whitelist.getAll(),
     count: whitelist.count()
@@ -1387,7 +1348,7 @@ app.get('/admin/whitelist', requireUploadSecret, adminLimiter, (_req: Request, r
 /**
  * Add a hash to the whitelist
  */
-app.post('/admin/whitelist', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
+app.post('/admin/whitelist', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const { hash, hashes } = req.body as { hash?: string; hashes?: string[] };
 
   try {
@@ -1423,7 +1384,7 @@ app.post('/admin/whitelist', requireUploadSecret, adminLimiter, async (req: Requ
 /**
  * Remove a hash from the whitelist
  */
-app.delete('/admin/whitelist/:hash', requireUploadSecret, adminLimiter, async (req: Request, res: Response) => {
+app.delete('/admin/whitelist/:hash', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const hash = req.params.hash;
 
   try {
@@ -1445,7 +1406,7 @@ app.delete('/admin/whitelist/:hash', requireUploadSecret, adminLimiter, async (r
 /**
  * Clear the entire whitelist
  */
-app.delete('/admin/whitelist', requireUploadSecret, adminLimiter, async (_req: Request, res: Response) => {
+app.delete('/admin/whitelist', adminLimiter, requireUploadSecret, async (_req: Request, res: Response) => {
   try {
     await whitelist.clear();
     res.json({
@@ -1455,6 +1416,47 @@ app.delete('/admin/whitelist', requireUploadSecret, adminLimiter, async (_req: R
     });
   } catch (error) {
     res.status(500).json({
+      error: 'Server error',
+      message: (error as Error).message
+    });
+  }
+});
+
+/**
+ * Drop a feed manifest's cached content ref and re-resolve it now.
+ * Call after publishing a new version of a feed, so the proxy stops serving the
+ * previous one without a restart (a seeded manifest is otherwise cached for 24h).
+ * Response: { ok: true, hash, refreshed, contentRef }. refreshed=false means the
+ * cached ref was dropped but nothing was re-resolved: the hash is unknown to the
+ * proxy, its owner is not in ALLOWED_FEED_OWNERS, or bee could not resolve it.
+ */
+app.post('/admin/feeds/:hash/refresh', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
+  const hash = req.params.hash;
+
+  if (!isManifestHash(hash)) {
+    res.status(400).json({
+      ok: false,
+      error: 'Bad request',
+      message: 'hash must be 64 hex characters'
+    });
+    return;
+  }
+
+  try {
+    const result = await refreshFeedManifest(feedCache, hash, {
+      isAllowedOwner: (owner) => ALLOWED_FEED_OWNERS.has(owner.toLowerCase()),
+      resolveFeed,
+      whitelist: async (contentRef) => {
+        if (!whitelist.isWhitelisted(contentRef)) {
+          await whitelist.add(contentRef);
+        }
+      }
+    });
+    console.log(`Feed refresh ${result.hash}: refreshed=${result.refreshed} contentRef=${result.contentRef}`);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
       error: 'Server error',
       message: (error as Error).message
     });
