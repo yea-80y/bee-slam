@@ -174,6 +174,7 @@ Route structure:
 - `POST /admin/whitelist` - Add hash(es)
 - `DELETE /admin/whitelist/:hash` - Remove specific hash
 - `DELETE /admin/whitelist` - Clear all
+- `POST /admin/feeds/:hash/refresh` - Drop a feed manifest's cached content ref and re-resolve it (TTL rules in `feed-cache.ts`)
 - `USE /bzz/:hash` - Proxies to Bee node if whitelisted (handles subpaths)
 
 **Routing note**: Express 5 changed wildcard handling. Use `app.use('/bzz/:hash', ...)` instead of `app.get('/bzz/:hash/*', ...)` to handle subpaths. Extract subpath from `req.path`.

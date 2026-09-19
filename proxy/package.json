@@ -8,6 +8,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
+    "test": "tsc -p tsconfig.test.json && tsx --test test/*.test.ts",
     "test:ens": "tsx src/test-ens.ts"
   },
   "keywords": [
