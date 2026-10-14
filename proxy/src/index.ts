@@ -1,9 +1,13 @@
 import express, { Request, Response, NextFunction } from 'express';
 import rateLimit from 'express-rate-limit';
 import { gunzipSync } from 'zlib';
+import { promises as fsp, readFileSync } from 'fs';
+import { dirname, join } from 'path';
 import { WhitelistManager } from './whitelist.js';
-import { FeedCache, SEEDED_FEED_MANIFESTS, isManifestHash, refreshFeedManifest } from './feed-cache.js';
+import { FeedCache, SEEDED_FEED_MANIFESTS, isManifestHash, refreshFeedManifest, type CacheOptions, type FeedInfo } from './feed-cache.js';
+import { readFeedUpdate, walkFeedForward, type FeedPoint } from './feed-walk.js';
 import { secretMatches } from './upload-secret.js';
+import { requestOrigin } from './request-origin.js';
 
 const app = express();
 const port = process.env.PORT ?? 3000;
@@ -23,7 +27,49 @@ const ALLOWED_FEED_OWNERS = new Set([
 // feed-cache.ts; manifests detected at runtime are registered here for owner/topic
 // lookup only. feed-cache.ts also owns the content-ref cache and decides every TTL:
 // 24h for a seeded manifest, 60s for everything else and for the /bzz 404 fallback.
-const feedCache = new FeedCache();
+const feedCache = new FeedCache({ onMarkAdvance: () => scheduleMarksWrite() });
+
+// The high-water marks, saved next to the whitelist so a restart resumes from the last
+// verified update instead of re-deriving it from bee's lookup, which can land short.
+const marksPath = process.env.FEED_MARKS_PATH ?? join(dirname(whitelistPath), 'feed-marks.json');
+let marksWrite: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleMarksWrite(): void {
+  if (marksWrite) return;
+  marksWrite = setTimeout(async () => {
+    marksWrite = null;
+    try {
+      const tmp = `${marksPath}.tmp`;
+      await fsp.writeFile(tmp, JSON.stringify(feedCache.exportMarks()), { mode: 0o600 });
+      await fsp.rename(tmp, marksPath);
+    } catch (err) {
+      console.error('Could not save feed marks:', err);
+    }
+  }, 1000);
+}
+
+function loadMarks(): void {
+  try {
+    const restored = feedCache.restoreMarks(JSON.parse(readFileSync(marksPath, 'utf8')));
+    console.log(`Restored ${restored} feed marks from ${marksPath}`);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') console.error('Could not read feed marks:', err);
+  }
+}
+
+// One background re-resolve per manifest at a time; requests meanwhile get the mark.
+const refreshing = new Map<string, Promise<void>>();
+
+function refreshInBackground(hash: string, info: FeedInfo, opts: CacheOptions = {}): void {
+  const key = hash.toLowerCase();
+  if (refreshing.has(key)) return;
+  refreshing.set(key, resolveLatest(info, feedCache.latest(key))
+    .then((point) => {
+      if (point) feedCache.set(key, point.ref, opts, point.index);
+    })
+    .catch((err) => console.error(`Background feed refresh failed for ${key}:`, err))
+    .finally(() => refreshing.delete(key)));
+}
 
 // Cache for hashes we've checked that are NOT feed manifests (to avoid repeated checks)
 const NOT_FEED_MANIFEST_CACHE = new Set<string>();
@@ -35,10 +81,10 @@ async function prewarmRegistryFeeds(): Promise<void> {
   console.log(`Pre-warming feed cache for ${entries.length} registry feeds...`);
   await Promise.all(entries.map(async ([manifestHash, info]) => {
     try {
-      const contentRef = await resolveFeed(info.owner, info.topic);
-      if (contentRef) {
-        feedCache.set(manifestHash, contentRef);
-        console.log(`  warmed ${manifestHash} -> ${contentRef}`);
+      const point = await resolveLatest(info, feedCache.latest(manifestHash));
+      if (point) {
+        feedCache.set(manifestHash, point.ref, {}, point.index);
+        console.log(`  warmed ${manifestHash} -> ${point.ref} (index ${point.index})`);
       } else {
         console.log(`  WARN: failed to resolve ${manifestHash} during pre-warm`);
       }
@@ -109,35 +155,73 @@ async function detectFeedManifest(hash: string): Promise<{ owner: string; topic:
 }
 
 /**
- * Resolve a feed to get the latest content reference
- * @param owner - Feed owner address (hex)
- * @param topic - Feed topic (hex)
- * @returns The content reference or null if not found
+ * Bee's own answer for a feed's latest update: its index and content ref. A HINT
+ * only - bee's lookup can land short (feed-walk.ts) - so callers verify it and
+ * walk forward from it, and nothing caches it as it stands.
  */
-async function resolveFeed(owner: string, topic: string): Promise<string | null> {
-  // Bee returns the resolved content reference in the `etag` header on
-  // GET /feeds/{owner}/{topic}. This is the canonical, documented field.
-  // The body bytes encode the SOC payload (timestamp + reference + padding)
-  // whose layout has historically been mis-parsed by hand-sliced offsets.
+async function beeFeedHint(owner: string, topic: string, timeoutMs: number = BEE_REQUEST_TIMEOUT): Promise<FeedPoint | null> {
   try {
-    const feedUrl = `${beeApiUrl}/feeds/${owner}/${topic}`;
-    const response = await fetchWithTimeout(feedUrl);
+    const response = await fetchWithTimeout(`${beeApiUrl}/feeds/${owner}/${topic}`, {}, timeoutMs);
     if (!response.ok) {
-      console.log(`Feed resolution failed with status: ${response.status}`);
+      console.log(`Feed lookup failed with status: ${response.status}`);
       return null;
     }
     // Drain body so the connection can be reused
     await response.arrayBuffer();
     const etag = response.headers.get('etag')?.replace(/"/g, '') ?? '';
-    if (/^[0-9a-f]{64}$/i.test(etag)) {
-      return etag.toLowerCase();
+    const indexHex = response.headers.get('swarm-feed-index') ?? '';
+    if (/^[0-9a-f]{64}$/i.test(etag) && /^[0-9a-f]{1,16}$/i.test(indexHex)) {
+      return { index: Number(BigInt(`0x${indexHex}`)), ref: etag.toLowerCase() };
     }
-    console.log(`Feed resolve: missing or malformed etag header: ${etag}`);
+    console.log(`Feed lookup: missing or malformed etag/index headers: ${etag} ${indexHex}`);
     return null;
   } catch (error) {
-    console.error('Feed resolution error:', error);
+    console.error('Feed lookup error:', error);
     return null;
   }
+}
+
+/** A raw chunk from our bee, or null when absent, slow or failing. */
+async function readChunk(address: string, timeoutMs: number): Promise<Uint8Array | null> {
+  try {
+    const response = await fetchWithTimeout(`${beeApiUrl}/chunks/${address}`, {}, timeoutMs);
+    if (!response.ok) return null;
+    return new Uint8Array(await response.arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+const FEED_PROBE_TIMEOUT_MS = 3000;
+// bee's lookup on a user's request: above the ~6 s it takes on a 241-update feed, well
+// under the 15 s read timeout.
+const REQUEST_HINT_TIMEOUT_MS = 8000;
+
+/**
+ * The newest verified update of a feed, never below `from`. `expectIndex` (a deploy
+ * saying which index it wrote) is read directly first. With nothing held yet, bee's
+ * lookup gives the starting point, verified before it is used. `inline` (a user is
+ * waiting): bee's lookup is time-boxed, and with no verified start the answer is null -
+ * the request falls through to bee - rather than a walk of the whole feed from zero.
+ */
+async function resolveLatest(
+  info: FeedInfo,
+  from: FeedPoint | undefined,
+  expectIndex?: number,
+  opts: { inline?: boolean } = {},
+): Promise<FeedPoint | null> {
+  const walk = { owner: info.owner, topic: info.topic, read: readChunk, probeTimeoutMs: FEED_PROBE_TIMEOUT_MS };
+  let base: FeedPoint | null = from ?? null;
+  if (expectIndex !== undefined && (!base || expectIndex > base.index)) {
+    base = (await readFeedUpdate(walk, expectIndex)) ?? base;
+  }
+  if (!base) {
+    const hint = await beeFeedHint(info.owner, info.topic, opts.inline ? REQUEST_HINT_TIMEOUT_MS : BEE_REQUEST_TIMEOUT);
+    if (hint) base = await readFeedUpdate(walk, hint.index);
+    if (!base && opts.inline) return null;
+  }
+  const ahead = await walkFeedForward({ ...walk, fromIndex: base?.index ?? -1 });
+  return ahead ?? base;
 }
 
 // Timeout for fetch requests to bee node (15 seconds)
@@ -356,7 +440,8 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
   const timestamp = new Date().toISOString();
   const ip = req.ip || req.socket.remoteAddress || 'unknown';
   const isLocal = isLocalRequest(req);
-  const logMessage = `${timestamp} - ${req.method} ${req.path} [ip=${ip} local=${isLocal}]`;
+  const origin = requestOrigin(req.headers.origin, req.headers.referer);
+  const logMessage = `${timestamp} - ${req.method} ${req.path} [ip=${ip} local=${isLocal} origin=${origin}]`;
   console.log(logMessage);
   next();
 });
@@ -1214,9 +1299,14 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
     // fetch is consistently faster once the content chunks are local.
     const knownFeedInfo = feedCache.lookup(hash);
     if (knownFeedInfo && ALLOWED_FEED_OWNERS.has(knownFeedInfo.owner.toLowerCase())) {
-      const contentRef = await resolveFeed(knownFeedInfo.owner, knownFeedInfo.topic);
-      if (contentRef) {
-        feedCache.set(hash, contentRef);
+      // Expired but held: serve the verified mark now and move forward in the
+      // background, so no request waits on a re-resolve. Nothing held: resolve inline.
+      const mark = feedCache.latest(hash);
+      if (mark) refreshInBackground(hash, knownFeedInfo);
+      const point = mark ?? (await resolveLatest(knownFeedInfo, undefined, undefined, { inline: true }));
+      if (point) {
+        if (!mark) feedCache.set(hash, point.ref, {}, point.index);
+        const contentRef = feedCache.latest(hash)!.ref;
         if (!whitelist.isWhitelisted(contentRef)) {
           await whitelist.add(contentRef);
         }
@@ -1260,13 +1350,16 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
 
         if (feedInfo) {
           console.log(`Feed manifest ${hash} failed, attempting direct feed resolution...`);
-          const contentRef = await resolveFeed(feedInfo.owner, feedInfo.topic);
+          const mark = feedCache.latest(hash);
+          if (mark) refreshInBackground(hash, feedInfo, { viaFallback: true });
+          const point = mark ?? (await resolveLatest(feedInfo, undefined, undefined, { inline: true }));
 
-          if (contentRef) {
+          if (point) {
             // Cache the resolved content reference for faster subsequent requests.
             // viaFallback caps this at 60s even for a seeded manifest: this path
             // only runs when bee could not walk the manifest, i.e. bee is unhealthy.
-            feedCache.set(hash, contentRef, { viaFallback: true });
+            if (!mark) feedCache.set(hash, point.ref, { viaFallback: true }, point.index);
+            const contentRef = feedCache.latest(hash)!.ref;
 
             // Whitelist the content reference so subpath requests work
             if (!whitelist.isWhitelisted(contentRef)) {
@@ -1426,9 +1519,10 @@ app.delete('/admin/whitelist', adminLimiter, requireUploadSecret, async (_req: R
  * Drop a feed manifest's cached content ref and re-resolve it now.
  * Call after publishing a new version of a feed, so the proxy stops serving the
  * previous one without a restart (a seeded manifest is otherwise cached for 24h).
- * Response: { ok: true, hash, refreshed, contentRef }. refreshed=false means the
- * cached ref was dropped but nothing was re-resolved: the hash is unknown to the
- * proxy, its owner is not in ALLOWED_FEED_OWNERS, or bee could not resolve it.
+ * Optional JSON body { index }: the feed index the deploy just wrote, read directly.
+ * Response: { ok: true, hash, refreshed, contentRef, index }. refreshed=false means
+ * nothing at or above `index` was verified: the hash is unknown to the proxy, its
+ * owner is not in ALLOWED_FEED_OWNERS, or the update could not be read yet.
  */
 app.post('/admin/feeds/:hash/refresh', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
   const hash = req.params.hash;
@@ -1442,17 +1536,27 @@ app.post('/admin/feeds/:hash/refresh', adminLimiter, requireUploadSecret, async 
     return;
   }
 
+  const expectIndex = (req.body as { index?: unknown } | undefined)?.index;
+  if (expectIndex !== undefined && !(Number.isSafeInteger(expectIndex) && (expectIndex as number) >= 0)) {
+    res.status(400).json({
+      ok: false,
+      error: 'Bad request',
+      message: 'index must be a non-negative integer'
+    });
+    return;
+  }
+
   try {
     const result = await refreshFeedManifest(feedCache, hash, {
       isAllowedOwner: (owner) => ALLOWED_FEED_OWNERS.has(owner.toLowerCase()),
-      resolveFeed,
+      resolveLatest,
       whitelist: async (contentRef) => {
         if (!whitelist.isWhitelisted(contentRef)) {
           await whitelist.add(contentRef);
         }
       }
-    });
-    console.log(`Feed refresh ${result.hash}: refreshed=${result.refreshed} contentRef=${result.contentRef}`);
+    }, expectIndex as number | undefined);
+    console.log(`Feed refresh ${result.hash}: refreshed=${result.refreshed} contentRef=${result.contentRef} index=${result.index}`);
     res.json(result);
   } catch (error) {
     res.status(500).json({
@@ -1467,6 +1571,7 @@ app.post('/admin/feeds/:hash/refresh', adminLimiter, requireUploadSecret, async 
 async function start(): Promise<void> {
   try {
     await whitelist.initialize();
+    loadMarks();
 
     // Pre-warm feed cache so first user request after restart hits cache, not bee's ~3s cold path
     await prewarmRegistryFeeds();

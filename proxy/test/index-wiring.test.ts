@@ -65,7 +65,7 @@ test('the refresh route rejects a malformed hash before touching the cache', () 
 test('the refresh route wires the real owner allowlist, resolver and whitelist', () => {
   const body = routeBody('post', '/admin/feeds/:hash/refresh');
   assert.match(body, /isAllowedOwner: \(owner\) => ALLOWED_FEED_OWNERS\.has\(owner\.toLowerCase\(\)\)/);
-  assert.match(body, /^\s*resolveFeed,$/m);
+  assert.match(body, /^\s*resolveLatest,$/m);
   assert.match(body, /await whitelist\.add\(contentRef\)/);
 });
 
@@ -88,4 +88,79 @@ test('index.ts computes no expiry of its own; every TTL comes from feed-cache.ts
   assert.doesNotMatch(source, /expires/);
   assert.doesNotMatch(source, /Date\.now\(\)\s*\+/);
   assert.doesNotMatch(source, /24 \* 60 \* 60 \* 1000/);
+});
+
+test('bee\'s feed lookup is only a hint: nothing caches it without verifying and walking forward', () => {
+  assert.doesNotMatch(source, /\bresolveFeed\(/, 'the old trust-bee resolver is gone');
+  const hintCalls = source.match(/beeFeedHint\(/g) ?? [];
+  assert.equal(hintCalls.length, 2, 'declared once, called once (inside resolveLatest)');
+  const resolveLatest = source.slice(source.indexOf('async function resolveLatest('), source.indexOf('\n}\n', source.indexOf('async function resolveLatest(')));
+  assert.match(resolveLatest, /beeFeedHint\(/);
+  assert.match(resolveLatest, /readFeedUpdate\(walk, hint\.index\)/, 'the hint is verified before use');
+  assert.match(resolveLatest, /walkFeedForward\(/);
+});
+
+test('every feed cache write carries its index, and serves what the cache holds after it', () => {
+  const writes = source.match(/feedCache\.set\([^;]*\);/g) ?? [];
+  assert.ok(writes.length >= 3, `found ${writes.length} writes`);
+  for (const w of writes) assert.match(w, /point\.index\)/, w);
+  for (const site of ['Registry fast-path', 'attempting direct feed resolution']) {
+    const at = source.indexOf(site);
+    const window = source.slice(Math.max(0, at - 1200), at + 1200);
+    assert.match(window, /feedCache\.latest\(hash\)!\.ref/, `${site}: serves the high-water ref, not the raw answer`);
+  }
+});
+
+test('every resolve starts from the high-water mark, or runs inline only when none is held', () => {
+  const uses = source.split('\n').filter((l) => /resolveLatest\(/.test(l) && !/function resolveLatest\(/.test(l));
+  assert.ok(uses.length >= 4, `found ${uses.length}`);
+  for (const c of uses) {
+    if (c.includes('{ inline: true }')) assert.match(c, /mark \?\? \(await resolveLatest\(\w+, undefined, undefined, \{ inline: true \}\)\)/, c);
+    else assert.match(c, /resolveLatest\(info, feedCache\.latest\(/, c);
+  }
+});
+
+test('an expired but held feed is served from its mark, and moved forward in the background', () => {
+  for (const site of ['Registry fast-path', 'attempting direct feed resolution']) {
+    const at = source.indexOf(site);
+    const window = source.slice(Math.max(0, at - 1400), at + 1400);
+    assert.match(window, /const mark = feedCache\.latest\(hash\);\n\s*if \(mark\) refreshInBackground\(hash,/, site);
+    assert.match(window, /if \(!mark\) feedCache\.set\(hash, point\.ref, /, `${site}: a served mark is not re-cached as if fresh`);
+  }
+  const bg = source.slice(source.indexOf('function refreshInBackground('), source.indexOf('\n}\n', source.indexOf('function refreshInBackground(')));
+  assert.match(bg, /if \(refreshing\.has\(key\)\) return;/, 'one re-resolve per manifest at a time');
+  assert.match(bg, /resolveLatest\(info, feedCache\.latest\(key\)\)/);
+  assert.match(bg, /\.finally\(\(\) => refreshing\.delete\(key\)\)/);
+});
+
+test('on a request, bee\'s lookup is time-boxed and nothing walks the whole feed from zero', () => {
+  const rl = source.slice(source.indexOf('async function resolveLatest('), source.indexOf('\n}\n', source.indexOf('async function resolveLatest(')));
+  assert.match(rl, /beeFeedHint\(info\.owner, info\.topic, opts\.inline \? REQUEST_HINT_TIMEOUT_MS : BEE_REQUEST_TIMEOUT\)/);
+  assert.match(rl, /if \(!base && opts\.inline\) return null;/);
+  assert.ok(rl.indexOf('if (!base && opts.inline) return null;') < rl.indexOf('walkFeedForward('));
+});
+
+test('marks are saved atomically next to the whitelist and restored before the prewarm', () => {
+  assert.match(source, /join\(dirname\(whitelistPath\), 'feed-marks\.json'\)/);
+  const save = source.slice(source.indexOf('function scheduleMarksWrite('), source.indexOf('\n}\n', source.indexOf('function scheduleMarksWrite(')));
+  assert.match(save, /writeFile\(tmp, JSON\.stringify\(feedCache\.exportMarks\(\)\), \{ mode: 0o600 \}\)/);
+  assert.match(save, /rename\(tmp, marksPath\)/);
+  const start = source.slice(source.indexOf('async function start('));
+  assert.ok(start.indexOf('loadMarks();') > 0 && start.indexOf('loadMarks();') < start.indexOf('await prewarmRegistryFeeds();'));
+  assert.match(source, /new FeedCache\(\{ onMarkAdvance: \(\) => scheduleMarksWrite\(\) \}\)/);
+});
+
+test('the refresh route validates a deploy index before anything else, and passes it on', () => {
+  const body = routeBody('post', '/admin/feeds/:hash/refresh');
+  const check = body.indexOf('Number.isSafeInteger(expectIndex)');
+  const call = body.indexOf('refreshFeedManifest(');
+  assert.ok(check > 0 && call > check, 'index validated before the refresh runs');
+  assert.match(body, /\}, expectIndex as number \| undefined\);/);
+});
+
+test('the request log names the site a request came from, through requestOrigin only', () => {
+  const log = source.slice(source.indexOf('// Logging middleware'), source.indexOf('next();', source.indexOf('// Logging middleware')));
+  assert.match(log, /const origin = requestOrigin\(req\.headers\.origin, req\.headers\.referer\);/);
+  assert.match(log, /\[ip=\$\{ip\} local=\$\{isLocal\} origin=\$\{origin\}\]/, 'appended, so existing ip/local greps keep working');
+  assert.doesNotMatch(log, /req\.headers\.(origin|referer)\}/, 'no raw header reaches the log');
 });

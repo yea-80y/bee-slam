@@ -10,6 +10,7 @@ import {
   refreshFeedManifest,
   ttlFor,
   type FeedCacheEntry,
+  type FeedPoint,
   type RefreshDeps,
 } from '../src/feed-cache.js';
 
@@ -36,12 +37,19 @@ function setup() {
   };
 }
 
-function fakeDeps(resolved: string | null = NEW_REF) {
-  const calls = { resolved: [] as Array<[string, string]>, whitelisted: [] as string[] };
+function fakeDeps(resolved: FeedPoint | null = { index: 7, ref: NEW_REF }) {
+  const calls = {
+    resolved: [] as Array<[string, string]>,
+    from: [] as Array<FeedPoint | undefined>,
+    expect: [] as Array<number | undefined>,
+    whitelisted: [] as string[],
+  };
   const deps: RefreshDeps = {
     isAllowedOwner: (owner) => owner.toLowerCase() === PLATFORM_OWNER,
-    resolveFeed: async (owner, topic) => {
-      calls.resolved.push([owner, topic]);
+    resolveLatest: async (info, from, expectIndex) => {
+      calls.resolved.push([info.owner, info.topic]);
+      calls.from.push(from);
+      calls.expect.push(expectIndex);
       return resolved;
     },
     whitelist: async (contentRef) => {
@@ -174,7 +182,7 @@ describe('refreshFeedManifest', () => {
 
     const result = await refreshFeedManifest(cache, SEEDED, deps);
 
-    assert.deepEqual(result, { ok: true, hash: SEEDED, refreshed: true, contentRef: NEW_REF });
+    assert.deepEqual(result, { ok: true, hash: SEEDED, refreshed: true, contentRef: NEW_REF, index: 7 });
     assert.deepEqual(calls.resolved, [[PLATFORM_OWNER, SEEDED_TOPIC]]);
     assert.equal(cache.get(SEEDED), NEW_REF);
     assert.equal(store.get(SEEDED)?.expires, now() + SEEDED_FEED_CACHE_TTL_MS);
@@ -189,7 +197,7 @@ describe('refreshFeedManifest', () => {
 
     const result = await refreshFeedManifest(cache, DETECTED, deps);
 
-    assert.deepEqual(result, { ok: true, hash: DETECTED, refreshed: true, contentRef: NEW_REF });
+    assert.deepEqual(result, { ok: true, hash: DETECTED, refreshed: true, contentRef: NEW_REF, index: 7 });
     assert.deepEqual(calls.resolved, [[PLATFORM_OWNER, DETECTED_TOPIC]]);
     assert.equal(store.get(DETECTED)?.expires, now() + FEED_CACHE_TTL_MS);
   });
@@ -201,7 +209,7 @@ describe('refreshFeedManifest', () => {
 
     const result = await refreshFeedManifest(cache, UNKNOWN, deps);
 
-    assert.deepEqual(result, { ok: true, hash: UNKNOWN, refreshed: false, contentRef: null });
+    assert.deepEqual(result, { ok: true, hash: UNKNOWN, refreshed: false, contentRef: null, index: null });
     assert.deepEqual(calls.resolved, []);
     assert.equal(cache.get(UNKNOWN), null);
   });
@@ -214,7 +222,7 @@ describe('refreshFeedManifest', () => {
 
     const result = await refreshFeedManifest(cache, DETECTED, deps);
 
-    assert.deepEqual(result, { ok: true, hash: DETECTED, refreshed: false, contentRef: null });
+    assert.deepEqual(result, { ok: true, hash: DETECTED, refreshed: false, contentRef: null, index: null });
     assert.deepEqual(calls.resolved, []);
     assert.equal(cache.get(DETECTED), null);
   });
@@ -226,7 +234,7 @@ describe('refreshFeedManifest', () => {
 
     const result = await refreshFeedManifest(cache, SEEDED, deps);
 
-    assert.deepEqual(result, { ok: true, hash: SEEDED, refreshed: false, contentRef: null });
+    assert.deepEqual(result, { ok: true, hash: SEEDED, refreshed: false, contentRef: null, index: null });
     assert.equal(store.size, 0);
     assert.deepEqual(calls.whitelisted, []);
   });
@@ -250,3 +258,117 @@ describe('refreshFeedManifest', () => {
     await assert.rejects(refreshFeedManifest(cache, SEEDED, deps), /disk full/);
   });
 });
+
+describe('never steps back (bee#5251: a short lookup once pinned an old build for a day)', () => {
+  test('a lower index after a higher one leaves the newer build served', () => {
+    const { cache } = setup();
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    cache.set(SEEDED, OLD_REF, {}, 224);
+    assert.equal(cache.get(SEEDED), NEW_REF);
+    assert.deepEqual(cache.latest(SEEDED), { index: 241, ref: NEW_REF });
+  });
+
+  test('a higher index moves the mark, and an equal one is accepted', () => {
+    const { cache } = setup();
+    cache.set(SEEDED, OLD_REF, {}, 240);
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    assert.deepEqual(cache.latest(SEEDED), { index: 241, ref: NEW_REF });
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    assert.equal(cache.get(SEEDED), NEW_REF);
+  });
+
+  test('the mark outlives the TTL, so a re-resolve after expiry starts from it', () => {
+    const { cache, advance } = setup();
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    advance(SEEDED_FEED_CACHE_TTL_MS);
+    assert.equal(cache.get(SEEDED), null);
+    assert.deepEqual(cache.latest(SEEDED), { index: 241, ref: NEW_REF });
+  });
+
+  test('a refused lower answer still re-arms the TTL with the newer ref', () => {
+    const { cache, store, now, advance } = setup();
+    cache.set(DETECTED, NEW_REF, {}, 9);
+    advance(FEED_CACHE_TTL_MS);
+    cache.set(DETECTED, OLD_REF, {}, 3);
+    assert.deepEqual(store.get(DETECTED), { contentRef: NEW_REF, expires: now() + FEED_CACHE_TTL_MS });
+  });
+
+  test('refresh resolves forward FROM the mark and passes the deploy index through', async () => {
+    const { cache } = setup();
+    const { deps, calls } = fakeDeps({ index: 242, ref: NEW_REF });
+    cache.set(SEEDED, OLD_REF, {}, 241);
+    const result = await refreshFeedManifest(cache, SEEDED, deps, 242);
+    assert.deepEqual(calls.from, [{ index: 241, ref: OLD_REF }]);
+    assert.deepEqual(calls.expect, [242]);
+    assert.deepEqual(result, { ok: true, hash: SEEDED, refreshed: true, contentRef: NEW_REF, index: 242 });
+  });
+
+  test('refresh that cannot reach the deploy index says so, and keeps serving the mark', async () => {
+    const { cache } = setup();
+    const { deps } = fakeDeps({ index: 241, ref: OLD_REF });
+    cache.set(SEEDED, OLD_REF, {}, 241);
+    const result = await refreshFeedManifest(cache, SEEDED, deps, 242);
+    assert.deepEqual(result, { ok: true, hash: SEEDED, refreshed: false, contentRef: OLD_REF, index: 241 });
+    assert.equal(cache.get(SEEDED), OLD_REF);
+  });
+
+  test('a resolver answering lower than the mark cannot lower what is served', async () => {
+    const { cache } = setup();
+    const { deps, calls } = fakeDeps({ index: 224, ref: OLD_REF });
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    const result = await refreshFeedManifest(cache, SEEDED, deps);
+    assert.equal(result.contentRef, NEW_REF);
+    assert.equal(result.index, 241);
+    assert.equal(cache.get(SEEDED), NEW_REF);
+    assert.deepEqual(calls.whitelisted, [NEW_REF]);
+  });
+
+  test('a failed resolve keeps the mark and reports it', async () => {
+    const { cache } = setup();
+    const { deps } = fakeDeps(null);
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    const result = await refreshFeedManifest(cache, SEEDED, deps);
+    assert.deepEqual(result, { ok: true, hash: SEEDED, refreshed: false, contentRef: NEW_REF, index: 241 });
+    assert.deepEqual(cache.latest(SEEDED), { index: 241, ref: NEW_REF });
+  });
+});
+
+describe('saved marks (a restart resumes from the last verified update)', () => {
+  test('export and restore round-trip', () => {
+    const { cache } = setup();
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    const saved = JSON.parse(JSON.stringify(cache.exportMarks()));
+    const fresh = setup().cache;
+    assert.equal(fresh.restoreMarks(saved), 1);
+    assert.deepEqual(fresh.latest(SEEDED), { index: 241, ref: NEW_REF });
+    assert.equal(fresh.get(SEEDED), null, 'a restored mark is a starting point, not a fresh cache entry');
+  });
+
+  test('malformed entries are skipped; a saved mark never lowers a held one', () => {
+    const { cache } = setup();
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    const n = cache.restoreMarks({
+      [SEEDED]: { index: 200, ref: OLD_REF },
+      [DETECTED]: { index: -1, ref: OLD_REF },
+      [UNKNOWN]: { index: 3, ref: 'not-hex' },
+      nothex: { index: 3, ref: OLD_REF },
+    });
+    assert.equal(n, 0);
+    assert.deepEqual(cache.latest(SEEDED), { index: 241, ref: NEW_REF });
+    assert.equal(cache.latest(DETECTED), undefined);
+    assert.equal(cache.restoreMarks(null), 0);
+    assert.equal(cache.restoreMarks('junk'), 0);
+  });
+
+  test('the save hook fires when a mark rises, not when it holds or is refused', () => {
+    let fired = 0;
+    const cache = new FeedCache({ onMarkAdvance: () => fired++ });
+    cache.set(SEEDED, OLD_REF, {}, 240);
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    cache.set(SEEDED, OLD_REF, {}, 239);
+    cache.set(SEEDED, OLD_REF);
+    assert.equal(fired, 2);
+  });
+});
+

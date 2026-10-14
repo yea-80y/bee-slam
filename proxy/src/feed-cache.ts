@@ -1,6 +1,12 @@
 // Feed-manifest cache rules: which manifests the proxy knows, what each one last
 // resolved to, and for how long that answer may be served. Kept free of express
 // and fetch so the rules can be tested on their own (test/feed-cache.test.ts).
+//
+// An answer carries its feed INDEX, and the cache never trades a higher index for a
+// lower one: bee's lookup can land short (feed-walk.ts), and before this one short
+// answer at a refresh, a prewarm or an expiry served an old build for up to a day.
+
+import type { FeedPoint } from './feed-walk.js';
 
 export interface FeedInfo {
   owner: string;
@@ -75,16 +81,49 @@ export interface FeedCacheEntry {
   expires: number;
 }
 
+export type { FeedPoint };
+
 // Keys are lowercased throughout so a refresh finds an entry however the hash was
 // cased in the request that cached it.
 export class FeedCache {
   private readonly detected = new Map<string, FeedInfo>();
   private readonly store: Map<string, FeedCacheEntry>;
+  // The highest verified update seen per manifest. Never expires and never goes
+  // down: every re-resolve starts from it.
+  private readonly highWater = new Map<string, FeedPoint>();
   private readonly now: () => number;
 
-  constructor(opts: { store?: Map<string, FeedCacheEntry>; now?: () => number } = {}) {
+  private readonly onMarkAdvance: () => void;
+
+  constructor(opts: { store?: Map<string, FeedCacheEntry>; now?: () => number; onMarkAdvance?: () => void } = {}) {
     this.store = opts.store ?? new Map();
     this.now = opts.now ?? (() => Date.now());
+    this.onMarkAdvance = opts.onMarkAdvance ?? (() => {});
+  }
+
+  /** Every high-water mark, for persisting: a restart then resumes from them. */
+  exportMarks(): Record<string, FeedPoint> {
+    return Object.fromEntries(this.highWater);
+  }
+
+  /**
+   * Marks saved by a previous run. Malformed entries are skipped, and a saved mark
+   * never lowers one this run already holds.
+   */
+  restoreMarks(saved: unknown): number {
+    if (!saved || typeof saved !== 'object') return 0;
+    let restored = 0;
+    for (const [hash, point] of Object.entries(saved as Record<string, unknown>)) {
+      const p = point as Partial<FeedPoint> | null;
+      if (!isManifestHash(hash) || !p || !Number.isSafeInteger(p.index) || (p.index as number) < 0) continue;
+      if (typeof p.ref !== 'string' || !/^[0-9a-f]{64}$/.test(p.ref)) continue;
+      const key = hash.toLowerCase();
+      const held = this.highWater.get(key);
+      if (held && held.index >= (p.index as number)) continue;
+      this.highWater.set(key, { index: p.index as number, ref: p.ref });
+      restored++;
+    }
+    return restored;
   }
 
   /** Owner and topic of a known manifest: seeded, or detected at runtime. */
@@ -106,10 +145,29 @@ export class FeedCache {
     return null;
   }
 
-  /** Caches a resolved content ref and returns the TTL applied, in ms. */
-  set(hash: string, contentRef: string, opts: CacheOptions = {}): number {
-    const ttl = ttlFor(hash, opts);
-    this.store.set(hash.toLowerCase(), { contentRef, expires: this.now() + ttl });
+  /** The highest update this manifest has resolved to, however long ago. */
+  latest(hash: string): FeedPoint | undefined {
+    return this.highWater.get(hash.toLowerCase());
+  }
+
+  /**
+   * Caches a resolved content ref and returns the TTL applied, in ms. With an
+   * `index`, an answer below the high-water mark is refused: the newer ref already
+   * held is served (and re-armed) instead.
+   */
+  set(hash: string, contentRef: string, opts: CacheOptions = {}, index?: number): number {
+    const key = hash.toLowerCase();
+    let ref = contentRef;
+    if (index !== undefined) {
+      const held = this.highWater.get(key);
+      if (held && held.index > index) ref = held.ref;
+      else {
+        this.highWater.set(key, { index, ref: contentRef });
+        if (!held || held.index < index) this.onMarkAdvance();
+      }
+    }
+    const ttl = ttlFor(key, opts);
+    this.store.set(key, { contentRef: ref, expires: this.now() + ttl });
     return ttl;
   }
 
@@ -120,7 +178,11 @@ export class FeedCache {
 
 export interface RefreshDeps {
   isAllowedOwner(owner: string): boolean;
-  resolveFeed(owner: string, topic: string): Promise<string | null>;
+  /**
+   * The newest VERIFIED update at or above `from`; when `expectIndex` is given, that
+   * update is read directly first (a deploy says which index it just wrote).
+   */
+  resolveLatest(info: FeedInfo, from: FeedPoint | undefined, expectIndex?: number): Promise<FeedPoint | null>;
   whitelist(contentRef: string): Promise<void>;
 }
 
@@ -129,33 +191,41 @@ export interface RefreshResult {
   hash: string;
   refreshed: boolean;
   contentRef: string | null;
+  /** The feed index of `contentRef`; null when nothing is held. */
+  index: number | null;
 }
 
 /**
  * Drops a manifest's cached content ref and, when the feed is known and its owner
- * trusted, re-resolves it now. An unknown hash is not an error: a deploy may refresh
- * a feed before any request has made the proxy see it. The drop happens either way,
- * so a failed re-resolve still stops the stale ref being served.
+ * trusted, re-resolves it now, forward from the highest update already seen. An
+ * unknown hash is not an error: a deploy may refresh a feed before any request has
+ * made the proxy see it. The drop happens either way, but the high-water mark is
+ * kept, so a failed or short re-resolve can never bring back an older build.
+ * `refreshed` is true only when the result reaches `expectIndex` (if given).
  */
 export async function refreshFeedManifest(
   cache: FeedCache,
   hash: string,
   deps: RefreshDeps,
+  expectIndex?: number,
 ): Promise<RefreshResult> {
   const key = hash.toLowerCase();
   cache.drop(key);
 
   const info = cache.lookup(key);
   if (!info || !deps.isAllowedOwner(info.owner)) {
-    return { ok: true, hash: key, refreshed: false, contentRef: null };
+    return { ok: true, hash: key, refreshed: false, contentRef: null, index: null };
   }
 
-  const contentRef = await deps.resolveFeed(info.owner, info.topic);
-  if (!contentRef) {
-    return { ok: true, hash: key, refreshed: false, contentRef: null };
+  const point = await deps.resolveLatest(info, cache.latest(key), expectIndex);
+  if (!point) {
+    const held = cache.latest(key);
+    return { ok: true, hash: key, refreshed: false, contentRef: held?.ref ?? null, index: held?.index ?? null };
   }
 
-  cache.set(key, contentRef);
-  await deps.whitelist(contentRef);
-  return { ok: true, hash: key, refreshed: true, contentRef };
+  cache.set(key, point.ref, {}, point.index);
+  const served = cache.latest(key)!;
+  await deps.whitelist(served.ref);
+  const refreshed = expectIndex === undefined || served.index >= expectIndex;
+  return { ok: true, hash: key, refreshed, contentRef: served.ref, index: served.index };
 }
