@@ -65,7 +65,7 @@ test('the refresh route rejects a malformed hash before touching the cache', () 
 test('the refresh route wires the real owner allowlist, resolver and whitelist', () => {
   const body = routeBody('post', '/admin/feeds/:hash/refresh');
   assert.match(body, /isAllowedOwner: \(owner\) => ALLOWED_FEED_OWNERS\.has\(owner\.toLowerCase\(\)\)/);
-  assert.match(body, /^\s*resolveFeed,$/m);
+  assert.match(body, /^\s*resolveLatest,$/m);
   assert.match(body, /await whitelist\.add\(contentRef\)/);
 });
 
@@ -88,4 +88,40 @@ test('index.ts computes no expiry of its own; every TTL comes from feed-cache.ts
   assert.doesNotMatch(source, /expires/);
   assert.doesNotMatch(source, /Date\.now\(\)\s*\+/);
   assert.doesNotMatch(source, /24 \* 60 \* 60 \* 1000/);
+});
+
+test('bee\'s feed lookup is only a hint: nothing caches it without verifying and walking forward', () => {
+  assert.doesNotMatch(source, /\bresolveFeed\(/, 'the old trust-bee resolver is gone');
+  const hintCalls = source.match(/beeFeedHint\(/g) ?? [];
+  assert.equal(hintCalls.length, 2, 'declared once, called once (inside resolveLatest)');
+  const resolveLatest = source.slice(source.indexOf('async function resolveLatest('), source.indexOf('\n}\n', source.indexOf('async function resolveLatest(')));
+  assert.match(resolveLatest, /beeFeedHint\(/);
+  assert.match(resolveLatest, /readFeedUpdate\(walk, hint\.index\)/, 'the hint is verified before use');
+  assert.match(resolveLatest, /walkFeedForward\(/);
+});
+
+test('every feed cache write carries its index, and serves what the cache holds after it', () => {
+  const writes = source.match(/feedCache\.set\([^;]*\);/g) ?? [];
+  assert.ok(writes.length >= 3, `found ${writes.length} writes`);
+  for (const w of writes) assert.match(w, /point\.index\)/, w);
+  for (const site of ['Registry fast-path', 'attempting direct feed resolution']) {
+    const at = source.indexOf(site);
+    const window = source.slice(Math.max(0, at - 1200), at + 1200);
+    assert.match(window, /feedCache\.latest\(hash\)!\.ref/, `${site}: serves the high-water ref, not the raw answer`);
+  }
+});
+
+test('every resolve starts from the high-water mark', () => {
+  const calls = source.match(/resolveLatest\([^)]*\)/g) ?? [];
+  const uses = calls.filter((c) => !c.includes('info: FeedInfo'));
+  assert.ok(uses.length >= 3);
+  for (const c of uses) assert.match(c, /feedCache\.latest\(/, c);
+});
+
+test('the refresh route validates a deploy index before anything else, and passes it on', () => {
+  const body = routeBody('post', '/admin/feeds/:hash/refresh');
+  const check = body.indexOf('Number.isSafeInteger(expectIndex)');
+  const call = body.indexOf('refreshFeedManifest(');
+  assert.ok(check > 0 && call > check, 'index validated before the refresh runs');
+  assert.match(body, /\}, expectIndex as number \| undefined\);/);
 });
