@@ -157,3 +157,10 @@ test('the refresh route validates a deploy index before anything else, and passe
   assert.ok(check > 0 && call > check, 'index validated before the refresh runs');
   assert.match(body, /\}, expectIndex as number \| undefined\);/);
 });
+
+test('the request log names the site a request came from, through requestOrigin only', () => {
+  const log = source.slice(source.indexOf('// Logging middleware'), source.indexOf('next();', source.indexOf('// Logging middleware')));
+  assert.match(log, /const origin = requestOrigin\(req\.headers\.origin, req\.headers\.referer\);/);
+  assert.match(log, /\[ip=\$\{ip\} local=\$\{isLocal\} origin=\$\{origin\}\]/, 'appended, so existing ip/local greps keep working');
+  assert.doesNotMatch(log, /req\.headers\.(origin|referer)\}/, 'no raw header reaches the log');
+});

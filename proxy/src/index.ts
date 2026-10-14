@@ -7,6 +7,7 @@ import { WhitelistManager } from './whitelist.js';
 import { FeedCache, SEEDED_FEED_MANIFESTS, isManifestHash, refreshFeedManifest, type CacheOptions, type FeedInfo } from './feed-cache.js';
 import { readFeedUpdate, walkFeedForward, type FeedPoint } from './feed-walk.js';
 import { secretMatches } from './upload-secret.js';
+import { requestOrigin } from './request-origin.js';
 
 const app = express();
 const port = process.env.PORT ?? 3000;
@@ -439,7 +440,8 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
   const timestamp = new Date().toISOString();
   const ip = req.ip || req.socket.remoteAddress || 'unknown';
   const isLocal = isLocalRequest(req);
-  const logMessage = `${timestamp} - ${req.method} ${req.path} [ip=${ip} local=${isLocal}]`;
+  const origin = requestOrigin(req.headers.origin, req.headers.referer);
+  const logMessage = `${timestamp} - ${req.method} ${req.path} [ip=${ip} local=${isLocal} origin=${origin}]`;
   console.log(logMessage);
   next();
 });
