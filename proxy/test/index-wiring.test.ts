@@ -111,11 +111,43 @@ test('every feed cache write carries its index, and serves what the cache holds 
   }
 });
 
-test('every resolve starts from the high-water mark', () => {
-  const calls = source.match(/resolveLatest\([^)]*\)/g) ?? [];
-  const uses = calls.filter((c) => !c.includes('info: FeedInfo'));
-  assert.ok(uses.length >= 3);
-  for (const c of uses) assert.match(c, /feedCache\.latest\(/, c);
+test('every resolve starts from the high-water mark, or runs inline only when none is held', () => {
+  const uses = source.split('\n').filter((l) => /resolveLatest\(/.test(l) && !/function resolveLatest\(/.test(l));
+  assert.ok(uses.length >= 4, `found ${uses.length}`);
+  for (const c of uses) {
+    if (c.includes('{ inline: true }')) assert.match(c, /mark \?\? \(await resolveLatest\(\w+, undefined, undefined, \{ inline: true \}\)\)/, c);
+    else assert.match(c, /resolveLatest\(info, feedCache\.latest\(/, c);
+  }
+});
+
+test('an expired but held feed is served from its mark, and moved forward in the background', () => {
+  for (const site of ['Registry fast-path', 'attempting direct feed resolution']) {
+    const at = source.indexOf(site);
+    const window = source.slice(Math.max(0, at - 1400), at + 1400);
+    assert.match(window, /const mark = feedCache\.latest\(hash\);\n\s*if \(mark\) refreshInBackground\(hash,/, site);
+    assert.match(window, /if \(!mark\) feedCache\.set\(hash, point\.ref, /, `${site}: a served mark is not re-cached as if fresh`);
+  }
+  const bg = source.slice(source.indexOf('function refreshInBackground('), source.indexOf('\n}\n', source.indexOf('function refreshInBackground(')));
+  assert.match(bg, /if \(refreshing\.has\(key\)\) return;/, 'one re-resolve per manifest at a time');
+  assert.match(bg, /resolveLatest\(info, feedCache\.latest\(key\)\)/);
+  assert.match(bg, /\.finally\(\(\) => refreshing\.delete\(key\)\)/);
+});
+
+test('on a request, bee\'s lookup is time-boxed and nothing walks the whole feed from zero', () => {
+  const rl = source.slice(source.indexOf('async function resolveLatest('), source.indexOf('\n}\n', source.indexOf('async function resolveLatest(')));
+  assert.match(rl, /beeFeedHint\(info\.owner, info\.topic, opts\.inline \? REQUEST_HINT_TIMEOUT_MS : BEE_REQUEST_TIMEOUT\)/);
+  assert.match(rl, /if \(!base && opts\.inline\) return null;/);
+  assert.ok(rl.indexOf('if (!base && opts.inline) return null;') < rl.indexOf('walkFeedForward('));
+});
+
+test('marks are saved atomically next to the whitelist and restored before the prewarm', () => {
+  assert.match(source, /join\(dirname\(whitelistPath\), 'feed-marks\.json'\)/);
+  const save = source.slice(source.indexOf('function scheduleMarksWrite('), source.indexOf('\n}\n', source.indexOf('function scheduleMarksWrite(')));
+  assert.match(save, /writeFile\(tmp, JSON\.stringify\(feedCache\.exportMarks\(\)\), \{ mode: 0o600 \}\)/);
+  assert.match(save, /rename\(tmp, marksPath\)/);
+  const start = source.slice(source.indexOf('async function start('));
+  assert.ok(start.indexOf('loadMarks();') > 0 && start.indexOf('loadMarks();') < start.indexOf('await prewarmRegistryFeeds();'));
+  assert.match(source, /new FeedCache\(\{ onMarkAdvance: \(\) => scheduleMarksWrite\(\) \}\)/);
 });
 
 test('the refresh route validates a deploy index before anything else, and passes it on', () => {

@@ -93,9 +93,37 @@ export class FeedCache {
   private readonly highWater = new Map<string, FeedPoint>();
   private readonly now: () => number;
 
-  constructor(opts: { store?: Map<string, FeedCacheEntry>; now?: () => number } = {}) {
+  private readonly onMarkAdvance: () => void;
+
+  constructor(opts: { store?: Map<string, FeedCacheEntry>; now?: () => number; onMarkAdvance?: () => void } = {}) {
     this.store = opts.store ?? new Map();
     this.now = opts.now ?? (() => Date.now());
+    this.onMarkAdvance = opts.onMarkAdvance ?? (() => {});
+  }
+
+  /** Every high-water mark, for persisting: a restart then resumes from them. */
+  exportMarks(): Record<string, FeedPoint> {
+    return Object.fromEntries(this.highWater);
+  }
+
+  /**
+   * Marks saved by a previous run. Malformed entries are skipped, and a saved mark
+   * never lowers one this run already holds.
+   */
+  restoreMarks(saved: unknown): number {
+    if (!saved || typeof saved !== 'object') return 0;
+    let restored = 0;
+    for (const [hash, point] of Object.entries(saved as Record<string, unknown>)) {
+      const p = point as Partial<FeedPoint> | null;
+      if (!isManifestHash(hash) || !p || !Number.isSafeInteger(p.index) || (p.index as number) < 0) continue;
+      if (typeof p.ref !== 'string' || !/^[0-9a-f]{64}$/.test(p.ref)) continue;
+      const key = hash.toLowerCase();
+      const held = this.highWater.get(key);
+      if (held && held.index >= (p.index as number)) continue;
+      this.highWater.set(key, { index: p.index as number, ref: p.ref });
+      restored++;
+    }
+    return restored;
   }
 
   /** Owner and topic of a known manifest: seeded, or detected at runtime. */
@@ -133,7 +161,10 @@ export class FeedCache {
     if (index !== undefined) {
       const held = this.highWater.get(key);
       if (held && held.index > index) ref = held.ref;
-      else this.highWater.set(key, { index, ref: contentRef });
+      else {
+        this.highWater.set(key, { index, ref: contentRef });
+        if (!held || held.index < index) this.onMarkAdvance();
+      }
     }
     const ttl = ttlFor(key, opts);
     this.store.set(key, { contentRef: ref, expires: this.now() + ttl });

@@ -332,3 +332,43 @@ describe('never steps back (bee#5251: a short lookup once pinned an old build fo
     assert.deepEqual(cache.latest(SEEDED), { index: 241, ref: NEW_REF });
   });
 });
+
+describe('saved marks (a restart resumes from the last verified update)', () => {
+  test('export and restore round-trip', () => {
+    const { cache } = setup();
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    const saved = JSON.parse(JSON.stringify(cache.exportMarks()));
+    const fresh = setup().cache;
+    assert.equal(fresh.restoreMarks(saved), 1);
+    assert.deepEqual(fresh.latest(SEEDED), { index: 241, ref: NEW_REF });
+    assert.equal(fresh.get(SEEDED), null, 'a restored mark is a starting point, not a fresh cache entry');
+  });
+
+  test('malformed entries are skipped; a saved mark never lowers a held one', () => {
+    const { cache } = setup();
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    const n = cache.restoreMarks({
+      [SEEDED]: { index: 200, ref: OLD_REF },
+      [DETECTED]: { index: -1, ref: OLD_REF },
+      [UNKNOWN]: { index: 3, ref: 'not-hex' },
+      nothex: { index: 3, ref: OLD_REF },
+    });
+    assert.equal(n, 0);
+    assert.deepEqual(cache.latest(SEEDED), { index: 241, ref: NEW_REF });
+    assert.equal(cache.latest(DETECTED), undefined);
+    assert.equal(cache.restoreMarks(null), 0);
+    assert.equal(cache.restoreMarks('junk'), 0);
+  });
+
+  test('the save hook fires when a mark rises, not when it holds or is refused', () => {
+    let fired = 0;
+    const cache = new FeedCache({ onMarkAdvance: () => fired++ });
+    cache.set(SEEDED, OLD_REF, {}, 240);
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    cache.set(SEEDED, NEW_REF, {}, 241);
+    cache.set(SEEDED, OLD_REF, {}, 239);
+    cache.set(SEEDED, OLD_REF);
+    assert.equal(fired, 2);
+  });
+});
+
