@@ -17,7 +17,7 @@ The bee node's API (port 1633) is isolated on an internal Docker network and can
 - **Bee node isolation**: API port 1633 is NOT exposed to the host - only accessible within Docker's internal network (`bee-internal`)
 - **Single entry point**: Only the proxy's port 3000 is exposed externally
 - **Whitelist enforcement**: All `/bzz/:hash` requests validated against persistent whitelist before proxying to Bee
-- **Persistence**: Whitelist stored in `/data/whitelist.json` within Docker volume, survives restarts
+- **Persistence**: Whitelist stored in `/data/whitelist.json` (snapshot) plus `/data/whitelist.json.log` (append-only log since the last compaction) within Docker volume, survives restarts. Back up BOTH files: the snapshot alone can be missing recent adds
 
 ### Bee Node Configuration (Critical)
 The Bee node runs in **ultra-light mode** which requires specific flags:
@@ -32,7 +32,7 @@ Without `--skip-postage-snapshot`, the node attempts blockchain sync even with `
 - **Strict typing**: All TypeScript with strict mode enabled (`noUnusedLocals`, `noUnusedParameters`, etc.)
 - **Express 5**: Uses latest Express with updated routing (no glob wildcards like `*` - use named params)
 - **Hash validation**: Only accepts 64-character hex strings (Swarm hash format)
-- **Persistence pattern**: `WhitelistManager` handles JSON serialization to Docker volume
+- **Persistence pattern**: `WhitelistManager` appends one fsynced line per change and folds the log into a compact snapshot by temp file + rename; startup refuses a snapshot or log it cannot read in full rather than start empty
 
 ## Development Workflow
 
@@ -159,10 +159,11 @@ proxy/
 
 ### WhitelistManager (`whitelist.ts`)
 Key methods:
-- `initialize()` - Loads JSON from disk, call at startup
+- `initialize()` - Loads the snapshot, replays the log, compacts; throws on anything unreadable. Call at startup
 - `isWhitelisted(hash)` - Query method for request validation
-- `add(hash)` / `addMany(hashes)` - Adds and persists atomically
+- `add(hash)` / `addMany(hashes)` - Durable (fsynced) before memory changes; `addMany` is all or nothing
 - `remove(hash)` - Removes and persists
+- `flush()` - Folds the log into the snapshot (runs on SIGTERM/SIGINT)
 - `getAll()` - Returns array of all hashes
 
 Validation: Enforces 64-character hex format via regex: `/^[0-9a-fA-F]{64}$/`
@@ -224,7 +225,7 @@ docker exec bee-proxy ping bee-node  # Test internal DNS
 ### Proxy (`docker-compose.yml`)
 - `PORT` - Proxy listen port (default: 3000)
 - `BEE_API_URL` - Internal URL to Bee node (default: `http://bee-node:1633`)
-- `WHITELIST_PATH` - Path to JSON file (default: `/data/whitelist.json`)
+- `WHITELIST_PATH` - Path to the snapshot (default: `/data/whitelist.json`); the log is `<WHITELIST_PATH>.log`
 
 ### ENS Test Script (`test-ens.ts`)
 - `PROXY_URL` - Proxy base URL (default: `http://localhost:3000`)
@@ -264,8 +265,8 @@ docker compose up -d --build proxy
 # View internal network
 docker network inspect bee-gateway_bee-internal
 
-# Check whitelist persistence
-docker exec bee-proxy cat /data/whitelist.json
+# Check whitelist persistence (snapshot + changes since the last compaction)
+docker exec bee-proxy sh -c 'wc -c /data/whitelist.json /data/whitelist.json.log'
 
 # Access bee node's internal API (from proxy container)
 docker exec bee-proxy curl http://bee-node:1633/health

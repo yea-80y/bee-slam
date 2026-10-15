@@ -164,3 +164,16 @@ test('the request log names the site a request came from, through requestOrigin 
   assert.match(log, /\[ip=\$\{ip\} local=\$\{isLocal\} origin=\$\{origin\}\]/, 'appended, so existing ip/local greps keep working');
   assert.doesNotMatch(log, /req\.headers\.(origin|referer)\}/, 'no raw header reaches the log');
 });
+
+test('shutdown folds the whitelist log into the snapshot before closing the server', () => {
+  // server.close can wait out the stop timeout on keep-alive connections, and a rollback
+  // to a build without the log reads whitelist.json alone.
+  const start = source.indexOf('const shutdown = (): void => {');
+  assert.ok(start >= 0, 'shutdown handler not found');
+  const body = source.slice(start, source.indexOf('\n      };', start));
+  const flush = body.indexOf('whitelist.flush()');
+  assert.ok(flush >= 0, 'shutdown does not flush the whitelist');
+  assert.ok(flush < body.indexOf('server.close('), 'server.close runs before the flush');
+  assert.match(source, /process\.on\('SIGTERM', shutdown\);/);
+  assert.match(source, /process\.on\('SIGINT', shutdown\);/);
+});

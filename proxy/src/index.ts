@@ -1594,22 +1594,22 @@ async function start(): Promise<void> {
 
       server.on('error', reject);
 
-      // Keep the process alive and handle shutdown gracefully
-      process.on('SIGINT', () => {
+      // Keep the process alive and handle shutdown gracefully. The whitelist is folded into
+      // whitelist.json first, before server.close can wait out the stop timeout: after a clean
+      // stop that file alone is complete, which is all an older build reads on a rollback.
+      const shutdown = (): void => {
         console.log('\nShutting down gracefully...');
-        server.close(() => {
-          console.log('Server closed');
-          process.exit(0);
-        });
-      });
-
-      process.on('SIGTERM', () => {
-        console.log('\nShutting down gracefully...');
-        server.close(() => {
-          console.log('Server closed');
-          process.exit(0);
-        });
-      });
+        whitelist.flush()
+          .catch((err) => console.error('Could not fold the whitelist log on shutdown:', err))
+          .finally(() => {
+            server.close(() => {
+              console.log('Server closed');
+              process.exit(0);
+            });
+          });
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
     });
 
     // Keep the event loop alive indefinitely
