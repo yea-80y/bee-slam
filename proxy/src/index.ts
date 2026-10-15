@@ -8,8 +8,11 @@ import { FeedCache, SEEDED_FEED_MANIFESTS, isManifestHash, refreshFeedManifest, 
 import { readFeedUpdate, walkFeedForward, type FeedPoint } from './feed-walk.js';
 import { secretMatches } from './upload-secret.js';
 import { requestOrigin } from './request-origin.js';
+import { noStoreOnErrors } from './no-store-errors.js';
 
 const app = express();
+// First, so every answer below it - a limiter's 429 included - is covered.
+app.use(noStoreOnErrors);
 const port = process.env.PORT ?? 3000;
 const beeApiUrl = process.env.BEE_API_URL ?? 'http://localhost:1633';
 const whitelistPath = process.env.WHITELIST_PATH ?? '/data/whitelist.json';
