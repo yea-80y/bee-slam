@@ -17,7 +17,7 @@ const port = process.env.PORT ?? 3000;
 const beeApiUrl = process.env.BEE_API_URL ?? 'http://localhost:1633';
 const whitelistPath = process.env.WHITELIST_PATH ?? '/data/whitelist.json';
 
-const whitelist = new WhitelistManager(whitelistPath);
+const whitelist = new WhitelistManager(whitelistPath, { allowEmptyStart: process.env.WHITELIST_ALLOW_EMPTY === '1' });
 
 // Feed owners that are allowed to create new feeds without manual whitelisting.
 // Any feed manifest from these owners bypasses the whitelist check automatically.
@@ -1594,22 +1594,25 @@ async function start(): Promise<void> {
 
       server.on('error', reject);
 
-      // Keep the process alive and handle shutdown gracefully
-      process.on('SIGINT', () => {
+      // Keep the process alive and handle shutdown gracefully. The whitelist is folded into
+      // whitelist.json first, before server.close can wait out the stop timeout: after a clean
+      // stop that file alone is complete, which is all an older build reads on a rollback.
+      const fold = (): Promise<void> =>
+        whitelist.flush().catch((err) => console.error('Could not fold the whitelist log on shutdown:', err));
+      const shutdown = (): void => {
         console.log('\nShutting down gracefully...');
-        server.close(() => {
-          console.log('Server closed');
-          process.exit(0);
+        void fold().finally(() => {
+          server.close(() => {
+            // Again: a request still draining may have added since the first fold.
+            void fold().finally(() => {
+              console.log('Server closed');
+              process.exit(0);
+            });
+          });
         });
-      });
-
-      process.on('SIGTERM', () => {
-        console.log('\nShutting down gracefully...');
-        server.close(() => {
-          console.log('Server closed');
-          process.exit(0);
-        });
-      });
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
     });
 
     // Keep the event loop alive indefinitely

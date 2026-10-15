@@ -164,3 +164,25 @@ test('the request log names the site a request came from, through requestOrigin 
   assert.match(log, /\[ip=\$\{ip\} local=\$\{isLocal\} origin=\$\{origin\}\]/, 'appended, so existing ip/local greps keep working');
   assert.doesNotMatch(log, /req\.headers\.(origin|referer)\}/, 'no raw header reaches the log');
 });
+
+test('shutdown folds the whitelist log into the snapshot before closing the server', () => {
+  // server.close can wait out the stop timeout on keep-alive connections, and a rollback
+  // to a build without the log reads whitelist.json alone.
+  const start = source.indexOf('const shutdown = (): void => {');
+  assert.ok(start >= 0, 'shutdown handler not found');
+  const body = source.slice(start, source.indexOf('\n      };', start));
+  assert.match(source, /const fold = \(\): Promise<void> =>\s*whitelist\.flush\(\)/);
+  const close = body.indexOf('server.close(');
+  const first = body.indexOf('fold()');
+  assert.ok(first >= 0 && first < close, 'server.close runs before the first fold');
+  // And again once requests have drained, since one may have added meanwhile.
+  const second = body.indexOf('fold()', close);
+  assert.ok(second > close && second < body.indexOf('process.exit(0)'), 'no fold between draining and exit');
+  assert.match(source, /process\.on\('SIGTERM', shutdown\);/);
+  assert.match(source, /process\.on\('SIGINT', shutdown\);/);
+});
+
+test('an empty start needs WHITELIST_ALLOW_EMPTY=1, never a default', () => {
+  // A wrong volume mount looks exactly like a fresh install.
+  assert.match(source, /new WhitelistManager\(whitelistPath, \{ allowEmptyStart: process\.env\.WHITELIST_ALLOW_EMPTY === '1' \}\)/);
+});
