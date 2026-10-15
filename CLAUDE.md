@@ -226,6 +226,7 @@ docker exec bee-proxy ping bee-node  # Test internal DNS
 - `PORT` - Proxy listen port (default: 3000)
 - `BEE_API_URL` - Internal URL to Bee node (default: `http://bee-node:1633`)
 - `WHITELIST_PATH` - Path to the snapshot (default: `/data/whitelist.json`); the log is `<WHITELIST_PATH>.log`
+- `WHITELIST_ALLOW_EMPTY` - Set to `1` for the FIRST start of a fresh install only. Without it the proxy refuses to start when no whitelist exists, because a wrong volume mount looks the same and an empty gateway reads every real chunk as absent
 
 ### ENS Test Script (`test-ens.ts`)
 - `PROXY_URL` - Proxy base URL (default: `http://localhost:3000`)

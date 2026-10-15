@@ -14,14 +14,25 @@ async function fresh(): Promise<string> {
   return join(dir, 'whitelist.json');
 }
 
+// Tests start from empty directories, so they opt in; the default is pinned by its own test.
 async function boot(path: string, options: WhitelistOptions = {}): Promise<WhitelistManager> {
-  const wl = new WhitelistManager(path, options);
+  const wl = new WhitelistManager(path, { allowEmptyStart: true, ...options });
   await wl.initialize();
   return wl;
 }
 
 const sorted = (wl: WhitelistManager): string[] => wl.getAll().sort();
 const logOf = (path: string): Promise<string> => readFile(`${path}.log`, 'utf8');
+
+test('with neither file present, boot refuses unless an empty start is allowed, and creates nothing', async () => {
+  const path = await fresh();
+  // What a wrong volume mount presents: an empty directory, indistinguishable from a fresh install.
+  await assert.rejects(new WhitelistManager(path).initialize(), /refusing to start with an empty whitelist/);
+  await assert.rejects(stat(path), { code: 'ENOENT' });
+  await assert.rejects(stat(`${path}.log`), { code: 'ENOENT' });
+  await writeFile(`${path}.log`, '');
+  await assert.rejects(new WhitelistManager(path).initialize(), /refusing to start with an empty whitelist/);
+});
 
 test('a first boot with no files starts empty and writes both files', async () => {
   const path = await fresh();
@@ -115,7 +126,7 @@ test('a missing snapshot beside a log with records refuses to start, and creates
   assert.equal(await logOf(path), `+${A}\n`);
 });
 
-test('a missing snapshot beside an empty log is a fresh install', async () => {
+test('a missing snapshot beside an empty log is a fresh install, once allowed', async () => {
   const path = await fresh();
   await writeFile(`${path}.log`, '');
   assert.equal((await boot(path)).count(), 0);
@@ -159,6 +170,11 @@ test('a log replayed over the snapshot it was folded into changes nothing', asyn
   await writeFile(path, JSON.stringify([B, C]));
   await writeFile(`${path}.log`, `+${A}\n+${B}\n-${A}\n+${C}\n`);
   assert.deepEqual(sorted(await boot(path)), [B, C].sort());
+
+  const cleared = await fresh();
+  await writeFile(cleared, JSON.stringify([B]));
+  await writeFile(`${cleared}.log`, `+${A}\nclear\n+${B}\n`);
+  assert.deepEqual(sorted(await boot(cleared)), [B]);
 });
 
 test('a crash at any compaction step loses no acknowledged operation', async () => {
@@ -243,7 +259,7 @@ test('removing a hash that is not listed writes nothing', async () => {
   assert.equal(await logOf(path), '');
 });
 
-test('a compaction that fails at runtime keeps the add, and the log keeps everything', async () => {
+test('a compaction that fails at runtime keeps the add, the log keeps everything, and it retries', async () => {
   const path = await fresh();
   const wl = await boot(path, { compactMin: 2 });
   await mkdir(`${path}.tmp`); // the temp file cannot be created
@@ -251,7 +267,13 @@ test('a compaction that fails at runtime keeps the add, and the log keeps everyt
   await wl.add(B);
   assert.deepEqual(sorted(wl), [A, B].sort());
   assert.equal(await logOf(path), `+${A}\n+${B}\n`);
-  assert.deepEqual(sorted(await boot(path).catch(() => wl)), [A, B].sort());
+  assert.deepEqual(sorted(await boot(path)), [A, B].sort());
+  await rmdir(`${path}.tmp`);
+  const D = hash();
+  await wl.add(C);
+  await wl.add(D);
+  assert.equal(await logOf(path), '', 'the retry after the failure never ran');
+  assert.deepEqual(JSON.parse(await readFile(path, 'utf8')).sort(), [A, B, C, D].sort());
 });
 
 test('a compaction that fails at boot keeps serving reads and, with a clean log, writes', async () => {
@@ -261,7 +283,7 @@ test('a compaction that fails at boot keeps serving reads and, with a clean log,
   const wl = await boot(path);
   assert.equal(wl.isWhitelisted(A), true);
   await wl.add(B);
-  assert.deepEqual(sorted(await boot(path).catch(() => wl)), [A, B].sort());
+  assert.deepEqual(sorted(await boot(path)), [A, B].sort());
 });
 
 test('a torn tail the boot compaction could not clean blocks writes until it can', async () => {
@@ -302,4 +324,10 @@ test('compaction makes the rename durable before it empties the log', async () =
   ].map(step => body.indexOf(step));
   assert.ok(order.every(i => i >= 0), `a compaction step is missing: ${order}`);
   assert.deepEqual([...order].sort((a, b) => a - b), order, 'compaction steps out of order');
+
+  // Same reason: an add must be on disk before it is served.
+  const commit = src.slice(src.indexOf('private async commit('), src.indexOf('private async compact()'));
+  const synced = commit.indexOf('await fh.datasync();');
+  assert.ok(synced >= 0, 'commit does not datasync the log');
+  assert.ok(synced < commit.indexOf('apply();'), 'memory changes before the log line is durable');
 });

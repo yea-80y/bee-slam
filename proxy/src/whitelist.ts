@@ -17,6 +17,9 @@ const LOG_RECORD = /^(?:[+-][0-9a-f]{64}|clear)$/;
 export type CompactionStep = 'temp-written' | 'renamed' | 'dir-synced' | 'log-emptied';
 
 export interface WhitelistOptions {
+  /** Start with an empty list when neither file exists. Off by default: a wrong volume mount
+   *  looks exactly like a fresh install, and an empty gateway reads every real chunk as absent. */
+  allowEmptyStart?: boolean;
   /** Log records that trigger a compaction, at least. The bar rises with the set's size. */
   compactMin?: number;
   /** Tests only: called after each compaction step; throwing there stands in for a crash. */
@@ -28,6 +31,7 @@ export class WhitelistManager {
   private persistPath: string;
   private logPath: string;
   private tempPath: string;
+  private allowEmptyStart: boolean;
   private compactMin: number;
   private onCompactionStep?: (step: CompactionStep) => void;
   private queue: Promise<unknown> = Promise.resolve();
@@ -43,6 +47,7 @@ export class WhitelistManager {
     this.persistPath = persistPath;
     this.logPath = `${persistPath}.log`;
     this.tempPath = `${persistPath}.tmp`;
+    this.allowEmptyStart = options.allowEmptyStart ?? false;
     this.compactMin = options.compactMin ?? 1024;
     this.onCompactionStep = options.onCompactionStep;
   }
@@ -61,6 +66,9 @@ export class WhitelistManager {
       // missing snapshot beside a non-empty log means it was deleted or moved.
       if (log !== null && log.length > 0) {
         throw new Error(`${this.persistPath} is missing but ${this.logPath} has records - refusing to start without the snapshot`);
+      }
+      if (!this.allowEmptyStart) {
+        throw new Error(`${this.persistPath} does not exist - refusing to start with an empty whitelist. Check the volume mount; on a fresh install, start once with WHITELIST_ALLOW_EMPTY=1`);
       }
       console.log('No existing whitelist found, starting with empty whitelist');
     }

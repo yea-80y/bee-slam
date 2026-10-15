@@ -171,9 +171,18 @@ test('shutdown folds the whitelist log into the snapshot before closing the serv
   const start = source.indexOf('const shutdown = (): void => {');
   assert.ok(start >= 0, 'shutdown handler not found');
   const body = source.slice(start, source.indexOf('\n      };', start));
-  const flush = body.indexOf('whitelist.flush()');
-  assert.ok(flush >= 0, 'shutdown does not flush the whitelist');
-  assert.ok(flush < body.indexOf('server.close('), 'server.close runs before the flush');
+  assert.match(source, /const fold = \(\): Promise<void> =>\s*whitelist\.flush\(\)/);
+  const close = body.indexOf('server.close(');
+  const first = body.indexOf('fold()');
+  assert.ok(first >= 0 && first < close, 'server.close runs before the first fold');
+  // And again once requests have drained, since one may have added meanwhile.
+  const second = body.indexOf('fold()', close);
+  assert.ok(second > close && second < body.indexOf('process.exit(0)'), 'no fold between draining and exit');
   assert.match(source, /process\.on\('SIGTERM', shutdown\);/);
   assert.match(source, /process\.on\('SIGINT', shutdown\);/);
+});
+
+test('an empty start needs WHITELIST_ALLOW_EMPTY=1, never a default', () => {
+  // A wrong volume mount looks exactly like a fresh install.
+  assert.match(source, /new WhitelistManager\(whitelistPath, \{ allowEmptyStart: process\.env\.WHITELIST_ALLOW_EMPTY === '1' \}\)/);
 });
