@@ -111,7 +111,7 @@ describe('TTL rules', () => {
     }, TypeError);
     cache.registerDetected(DETECTED, { owner: PLATFORM_OWNER, topic: DETECTED_TOPIC });
     assert.equal(isSeededFeedManifest(DETECTED), false);
-    assert.equal(Object.keys(SEEDED_FEED_MANIFESTS).length, 4);
+    assert.equal(Object.keys(SEEDED_FEED_MANIFESTS).length, 5);
   });
 });
 

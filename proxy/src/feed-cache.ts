@@ -25,7 +25,14 @@ export interface FeedInfo {
  * answers "whose feed is this" and never lengthens a TTL.
  */
 export const SEEDED_FEED_MANIFESTS: Readonly<Record<string, Readonly<FeedInfo>>> = Object.freeze({
-  // WoCo Events App feed manifest (topic: woco-events-v1) — used by woco.eth.limo
+  // WoCo app feed manifest from launch (topic: woco-app-v1, 2026-10-23) — woco.eth.limo and
+  // app.woco.eth.limo. Feed updates and this manifest are on the core batch, never replaced.
+  'a6792e9294740ac34229f83edda806fddc93d833f3b0d81d02ed6d0fc91107bd': Object.freeze({
+    owner: 'f8af4904c6e4f08ce5f7deab7f01221280b23a80',
+    topic: 'e9a7db81030196a62ac537b080cdf0b34c86bf590e5bfb74fdb54095587b28fa'
+  }),
+  // The app's pre-launch feed manifest (topic: woco-events-v1) — kept so open tabs and old
+  // links still resolve to its last build.
   'd66c6ff7650a468c2fd98439c8f04547b5b8a4b933d349ff16db1d0b00c23adc': Object.freeze({
     owner: 'f8af4904c6e4f08ce5f7deab7f01221280b23a80',
     topic: 'aef7b3bb8b50eff1516536370de7ab15de8e24592a35d2abd9977d00ebb650b2'
