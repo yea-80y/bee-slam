@@ -12,10 +12,12 @@
  * address that is not itself listed. Nothing a client gets here is trusted by
  * it either: the reader hashes each blob back to its root.
  *
- * DELISTING. The list is checked just before each root's bee read and again
- * when the read finishes, and a blob delisted in between is dropped as
- * not-whitelisted. Callers that delist before destroying the data (WoCo erases
- * an order that way) therefore never see a blob served after its delisting.
+ * DELISTING. The list is checked just before each root's bee read (an unlisted
+ * root costs no read) and again as the response is assembled - so a blob delisted
+ * at any point before the bundle is sent, during its own read or while slower
+ * roots finish, is dropped as not-whitelisted. Callers that delist before
+ * destroying the data (WoCo erases an order that way) never get a blob in a
+ * response sent after its delisting.
  *
  * Wire format (request order preserved, exactly one item per root):
  *   request   application/json  {"v":1,"roots":["<64 hex>", ...]}
@@ -105,11 +107,6 @@ export async function buildBundle(
       read = { status: 'error' };
     }
     if (expired) return;
-    // Delisted while it was read: the blob is not served.
-    if (!deps.isListed(root)) {
-      results[i] = { status: 'not-whitelisted' };
-      return;
-    }
     results[i] = read.status === 'ok' ? { status: 'ok', bytes: read.bytes } : { status: read.status };
   };
 
@@ -135,6 +132,11 @@ export async function buildBundle(
   roots.forEach((root, i) => {
     const r = results[i];
     if (r?.status === 'ok' && r.bytes) {
+      // Read early in a slow bundle and delisted since: not in this response either.
+      if (!deps.isListed(root)) {
+        items.push({ root, status: 'not-whitelisted' });
+        return;
+      }
       items.push({ root, status: 'ok', len: r.bytes.length });
       blobs.push(r.bytes);
     } else {

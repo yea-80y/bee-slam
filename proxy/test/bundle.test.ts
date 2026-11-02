@@ -111,6 +111,28 @@ test('a root delisted while it was being read is not served', async () => {
   assert.equal(blobs.length, 1);
 });
 
+test('a root read early and delisted before the bundle is sent is not in the response', async () => {
+  const listed = new Set([R('a'), R('b')]);
+  let releaseB!: () => void;
+  const bReady = new Promise<void>((r) => (releaseB = r));
+  const d: BundleDeps = {
+    isListed: (r) => listed.has(r),
+    async readBlob(root) {
+      if (root === R('b')) {
+        // a is already read and checked; it is delisted while b is still being read.
+        listed.delete(R('a'));
+        await bReady;
+      }
+      return { status: 'ok', bytes: bytes(`blob-${root.slice(0, 2)}`) };
+    },
+  };
+  const pending = buildBundle([R('a'), R('b')], d, { concurrency: 1 });
+  releaseB();
+  const { items, blobs } = await pending;
+  assert.deepEqual(items.map((i) => i.status), ['not-whitelisted', 'ok']);
+  assert.equal(blobs.length, 1);
+});
+
 test('bee failures map per root: thrown = error, not found, too large', async () => {
   const listed = new Set([R('a'), R('b'), R('c')]);
   const d: BundleDeps = {
