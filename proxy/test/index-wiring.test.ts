@@ -186,3 +186,22 @@ test('an empty start needs WHITELIST_ALLOW_EMPTY=1, never a default', () => {
   // A wrong volume mount looks exactly like a fresh install.
   assert.match(source, /new WhitelistManager\(whitelistPath, \{ allowEmptyStart: process\.env\.WHITELIST_ALLOW_EMPTY === '1' \}\)/);
 });
+
+test('the bundle route: its own limiter, never cached, gated on the whitelist alone', () => {
+  assert.equal(guardsOf('post', '/bytes-bundle'), 'bundleLimiter,');
+  const body = routeBody('post', '/bytes-bundle');
+  assert.ok(body.indexOf("res.setHeader('Cache-Control', 'no-store');") >= 0, 'no-store');
+  assert.ok(
+    body.indexOf("res.setHeader('Cache-Control', 'no-store');") < body.indexOf('parseBundleRequest('),
+    'set first, so the 400 is not cacheable either',
+  );
+  assert.match(body, /isListed: \(root\) => whitelist\.isWhitelisted\(root\),/, 'the list, never feed-manifest detection');
+  assert.doesNotMatch(body, /isHashAllowed|detectFeedManifest/);
+  const limiter = source.slice(source.indexOf('const bundleLimiter = rateLimit({'), source.indexOf('});', source.indexOf('const bundleLimiter = rateLimit({')));
+  assert.match(limiter, /standardHeaders: true,/);
+  assert.match(limiter, /skip: \(req: Request\) => isLocalRequest\(req\),/);
+});
+
+test('a browser caches the CORS preflight instead of asking before every bundle', () => {
+  assert.match(source, /res\.setHeader\('Access-Control-Max-Age', '600'\);\s*if \(_req\.method === 'OPTIONS'\)/);
+});
