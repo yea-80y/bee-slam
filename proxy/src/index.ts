@@ -9,6 +9,8 @@ import { readFeedUpdate, walkFeedForward, type FeedPoint } from './feed-walk.js'
 import { secretMatches } from './upload-secret.js';
 import { requestOrigin } from './request-origin.js';
 import { noStoreOnErrors } from './no-store-errors.js';
+import { copyBeeHeaders, EXPOSED_HEADERS } from './bee-headers.js';
+import { BUNDLE_MAX_ROOTS, beeBlobReader, buildBundle, encodeBundle, parseBundleRequest } from './bundle.js';
 
 const app = express();
 // First, so every answer below it - a limiter's 429 included - is covered.
@@ -368,6 +370,18 @@ const uploadLimiter = rateLimit({
   skip: (req: Request) => isLocalRequest(req), // Skip rate limiting for local requests
 });
 
+// Bundle rate limit - 120 bundles per minute per IP, up to BUNDLE_MAX_ROOTS blobs
+// each. Route-level, so it runs after the general limiter and its RateLimit-*
+// headers are the ones a bundle reader sees (the budget that matters to it).
+const bundleLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  message: 'Too many bundle requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req: Request) => isLocalRequest(req),
+});
+
 // Admin endpoint rate limit - 50 requests per 15 minutes per IP. Placed BEFORE
 // requireUploadSecret on every admin route, so a wrong secret is counted too:
 // guessing it costs the same budget as using it.
@@ -400,9 +414,12 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-upload-secret, swarm-postage-batch-id, swarm-deferred-upload, swarm-redundancy-level, swarm-encrypt, swarm-index-document, swarm-error-document, swarm-collection, swarm-pin, swarm-tag');
-  // X-Chunk-Gate must be exposed or a browser cannot read it at all (CORS
-  // hides every non-safelisted response header by default).
-  res.setHeader('Access-Control-Expose-Headers', 'swarm-tag, etag, X-Chunk-Gate');
+  // X-Chunk-Gate and the RateLimit headers must be exposed or a browser cannot
+  // read them at all (CORS hides every non-safelisted response header by default).
+  // Routes that relay bee keep this list: copyBeeHeaders never copies bee's CORS.
+  res.setHeader('Access-Control-Expose-Headers', EXPOSED_HEADERS);
+  // A browser asks once per 10 minutes, not before every JSON POST (/bytes-bundle).
+  res.setHeader('Access-Control-Max-Age', '600');
   if (_req.method === 'OPTIONS') {
     res.sendStatus(200);
     return;
@@ -823,9 +840,7 @@ app.get('/bytes/:hash', async (req: Request, res: Response) => {
     const response = await fetchWithTimeout(url);
 
     // Copy headers
-    response.headers.forEach((value, key) => {
-      res.setHeader(key, value);
-    });
+    copyBeeHeaders(response.headers, (k, v) => res.setHeader(k, v));
 
     res.status(response.status);
 
@@ -843,6 +858,29 @@ app.get('/bytes/:hash', async (req: Request, res: Response) => {
       message: (error as Error).message
     });
   }
+});
+
+/**
+ * POST /bytes-bundle — many whitelisted /bytes blobs in one request (bundle.ts:
+ * wire format, gate and delisting rules). Never cached: what the list allows
+ * changes, and a delisted blob must stop being served.
+ */
+const readBundleBlob = beeBlobReader(beeApiUrl);
+app.post('/bytes-bundle', bundleLimiter, async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const roots = parseBundleRequest(req.body);
+  if (!roots) {
+    res.status(400).json({
+      error: 'Bad request',
+      message: `Body must be {"v":1,"roots":[...]} with 1-${BUNDLE_MAX_ROOTS} distinct 64-hex references`,
+    });
+    return;
+  }
+  const { items, blobs } = await buildBundle(roots, {
+    isListed: (root) => whitelist.isWhitelisted(root),
+    readBlob: readBundleBlob,
+  });
+  res.status(200).type('application/octet-stream').send(encodeBundle(items, blobs));
 });
 
 /**
@@ -890,9 +928,7 @@ app.get('/chunks/:hash', async (req: Request, res: Response) => {
     const url = `${beeApiUrl}/chunks/${hash}`;
     const response = await fetchWithTimeout(url);
 
-    response.headers.forEach((value, key) => {
-      res.setHeader(key, value);
-    });
+    copyBeeHeaders(response.headers, (k, v) => res.setHeader(k, v));
     res.status(response.status);
 
     if (response.body) {
@@ -928,9 +964,7 @@ app.get('/feeds/:owner/:topic', async (req: Request, res: Response) => {
     const response = await fetchWithTimeout(url);
 
     // Copy headers
-    response.headers.forEach((value, key) => {
-      res.setHeader(key, value);
-    });
+    copyBeeHeaders(response.headers, (k, v) => res.setHeader(k, v));
 
     res.status(response.status);
 
@@ -1224,12 +1258,12 @@ app.post('/soc/:owner/:id',
 
       // Copy headers from Bee response, but skip content-encoding and content-length
       // since we may have decompressed the data
-      response.headers.forEach((value, key) => {
+      copyBeeHeaders(
+        response.headers,
+        (k, v) => res.setHeader(k, v),
         // Don't copy content-encoding or content-length as we're sending decompressed data
-        if (key.toLowerCase() !== 'content-encoding' && key.toLowerCase() !== 'content-length') {
-          res.setHeader(key, value);
-        }
-      });
+        (k) => k === 'content-encoding' || k === 'content-length',
+      );
 
       // Set correct content-length for the actual buffer we're sending
       res.setHeader('content-length', responseBuffer.length.toString());
@@ -1280,9 +1314,7 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
       console.log(`Using cached feed content: ${proxyUrl}`);
 
       const contentResponse = await fetchWithTimeout(proxyUrl);
-      contentResponse.headers.forEach((value, key) => {
-        res.setHeader(key, value);
-      });
+      copyBeeHeaders(contentResponse.headers, (k, v) => res.setHeader(k, v));
       res.status(contentResponse.status);
 
       if (contentResponse.body) {
@@ -1319,9 +1351,7 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
         console.log(`Registry fast-path: ${hash} -> ${contentRef} (${proxyUrl})`);
 
         const contentResponse = await fetchWithTimeout(proxyUrl);
-        contentResponse.headers.forEach((value, key) => {
-          res.setHeader(key, value);
-        });
+        copyBeeHeaders(contentResponse.headers, (k, v) => res.setHeader(k, v));
         res.status(contentResponse.status);
         if (contentResponse.body) {
           const reader = contentResponse.body.getReader();
@@ -1380,9 +1410,7 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
               const contentResponse = await fetchWithTimeout(proxyUrl);
 
               // Copy headers from content response
-              contentResponse.headers.forEach((value, key) => {
-                res.setHeader(key, value);
-              });
+              copyBeeHeaders(contentResponse.headers, (k, v) => res.setHeader(k, v));
 
               res.status(contentResponse.status);
 
@@ -1407,9 +1435,7 @@ app.use('/bzz/:hash', async (req: Request, res: Response) => {
     }
 
     // Copy headers
-    response.headers.forEach((value, key) => {
-      res.setHeader(key, value);
-    });
+    copyBeeHeaders(response.headers, (k, v) => res.setHeader(k, v));
 
     res.status(response.status);
 
@@ -1589,6 +1615,7 @@ async function start(): Promise<void> {
         console.log('  - General: 1000 req/1min per IP');
         console.log('  - Uploads: 2000 req/1hour per IP');
         console.log('  - Admin: 50 req/15min per IP');
+        console.log('  - Bundles: 120 req/1min per IP');
         resolve();
       });
 
