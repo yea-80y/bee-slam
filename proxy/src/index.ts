@@ -370,12 +370,18 @@ const uploadLimiter = rateLimit({
   skip: (req: Request) => isLocalRequest(req), // Skip rate limiting for local requests
 });
 
-// Bundle rate limit - 120 bundles per minute per IP, up to BUNDLE_MAX_ROOTS blobs
+// Bundle rate limit - 300 bundles per minute per IP, up to BUNDLE_MAX_ROOTS blobs
 // each. Route-level, so it runs after the general limiter and its RateLimit-*
 // headers are the ones a bundle reader sees (the budget that matters to it).
+// 300, not 120 (WoCo #1061): an organiser's dashboard reads one sealed order per
+// sale, and WoCo's reader stops at 75% of this budget. At 120 a 20,000-order event
+// (200 bundles) paused twice for the next window, ~2 minutes in all; at 300 it
+// fits one window, ~50 s, bounded by the bee reads themselves. Ceiling per IP:
+// 30,000 whitelisted blobs a minute - the same blobs GET /bytes serves one at a
+// time; WoCo's attendee orders among them are sealed to their organiser's key.
 const bundleLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 120,
+  max: 300,
   message: 'Too many bundle requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
@@ -1615,7 +1621,7 @@ async function start(): Promise<void> {
         console.log('  - General: 1000 req/1min per IP');
         console.log('  - Uploads: 2000 req/1hour per IP');
         console.log('  - Admin: 50 req/15min per IP');
-        console.log('  - Bundles: 120 req/1min per IP');
+        console.log('  - Bundles: 300 req/1min per IP');
         resolve();
       });
 
