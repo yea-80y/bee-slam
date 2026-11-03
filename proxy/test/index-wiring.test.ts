@@ -200,6 +200,9 @@ test('the bundle route: its own limiter, never cached, gated on the whitelist al
   const limiter = source.slice(source.indexOf('const bundleLimiter = rateLimit({'), source.indexOf('});', source.indexOf('const bundleLimiter = rateLimit({')));
   assert.match(limiter, /standardHeaders: true,/);
   assert.match(limiter, /skip: \(req: Request\) => isLocalRequest\(req\),/);
+  // WoCo #1061: a 20,000-order dashboard (200 bundles) fits one window at 75% of this.
+  assert.match(limiter, /windowMs: 60 \* 1000,\s*max: 300,/);
+  assert.match(source, /console\.log\('  - Bundles: 300 req\/1min per IP'\);/, 'the startup line says what runs');
 });
 
 test('a browser caches the CORS preflight instead of asking before every bundle', () => {
