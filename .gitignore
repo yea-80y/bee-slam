@@ -10,7 +10,6 @@ proxy-data/
 # Proxy dependencies and build artifacts
 proxy/node_modules/
 proxy/dist/
-proxy/pnpm-lock.yaml
 
 # Build artifacts
 *.log
