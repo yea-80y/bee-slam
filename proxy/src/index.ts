@@ -827,7 +827,7 @@ async function isHashAllowed(
  * GET /bytes/:hash endpoint for retrieving raw bytes
  * Only allows access to whitelisted hashes
  */
-app.get('/bytes/:hash', async (req: Request, res: Response) => {
+app.get('/bytes/:hash', async (req: Request<{ hash: string }>, res: Response) => {
   const hash = req.params.hash;
 
   if (!(await isHashAllowed(hash))) {
@@ -901,7 +901,7 @@ app.post('/bytes-bundle', bundleLimiter, async (req: Request, res: Response) => 
  * served. Internal caller (events-api) hits this immediately after a /bzz
  * upload that auto-whitelisted the hash.
  */
-app.get('/chunks/:hash', async (req: Request, res: Response) => {
+app.get('/chunks/:hash', async (req: Request<{ hash: string }>, res: Response) => {
   const hash = req.params.hash;
 
   if (!(await isHashAllowed(hash, { detectManifests: false }))) {
@@ -1291,7 +1291,7 @@ app.post('/soc/:owner/:id',
  * Only allows access to whitelisted hashes
  * Handles both /bzz/:hash and /bzz/:hash/subpath/...
  */
-app.use('/bzz/:hash', async (req: Request, res: Response) => {
+app.use('/bzz/:hash', async (req: Request<{ hash: string }>, res: Response) => {
   const hash = req.params.hash;
   // Extract the subpath by removing /bzz/:hash from the full path
   // Use req.originalUrl to get the complete path
@@ -1512,7 +1512,7 @@ app.post('/admin/whitelist', adminLimiter, requireUploadSecret, async (req: Requ
 /**
  * Remove a hash from the whitelist
  */
-app.delete('/admin/whitelist/:hash', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
+app.delete('/admin/whitelist/:hash', adminLimiter, requireUploadSecret, async (req: Request<{ hash: string }>, res: Response) => {
   const hash = req.params.hash;
 
   try {
@@ -1559,7 +1559,7 @@ app.delete('/admin/whitelist', adminLimiter, requireUploadSecret, async (_req: R
  * nothing at or above `index` was verified: the hash is unknown to the proxy, its
  * owner is not in ALLOWED_FEED_OWNERS, or the update could not be read yet.
  */
-app.post('/admin/feeds/:hash/refresh', adminLimiter, requireUploadSecret, async (req: Request, res: Response) => {
+app.post('/admin/feeds/:hash/refresh', adminLimiter, requireUploadSecret, async (req: Request<{ hash: string }>, res: Response) => {
   const hash = req.params.hash;
 
   if (!isManifestHash(hash)) {
